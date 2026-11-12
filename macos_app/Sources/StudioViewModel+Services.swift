@@ -10,21 +10,42 @@ final class KeepalivePipeLineBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var pending = Data()
 
-    func appendAndExtractPayloads(_ chunk: Data) -> [String] {
+    func appendAndExtractLines(_ chunk: Data) -> [String] {
         lock.lock()
         defer { lock.unlock() }
         pending.append(chunk)
-        var payloads: [String] = []
+        var lines: [String] = []
         while let nlIdx = pending.firstIndex(of: 0x0A) {
             let lineData = pending.subdata(in: 0..<nlIdx)
             pending.removeSubrange(0...nlIdx)
             if let lineStr = String(data: lineData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
-               lineStr.hasPrefix("KEEPALIVE_JSON:") {
-                payloads.append(String(lineStr.dropFirst("KEEPALIVE_JSON:".count)))
+               !lineStr.isEmpty {
+                lines.append(lineStr)
             }
         }
-        return payloads
+        return lines
+    }
+
+    func flushRemainingLine() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !pending.isEmpty else { return nil }
+        let rem = pending
+        pending.removeAll()
+        if let lineStr = String(data: rem, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !lineStr.isEmpty {
+            return lineStr
+        }
+        return nil
+    }
+
+    func appendAndExtractPayloads(_ chunk: Data) -> [String] {
+        appendAndExtractLines(chunk).compactMap { lineStr in
+            guard lineStr.hasPrefix("KEEPALIVE_JSON:") else { return nil }
+            return String(lineStr.dropFirst("KEEPALIVE_JSON:".count))
+        }
     }
 }
 
@@ -207,6 +228,7 @@ extension StudioViewModel {
     }
 
     func logoutGoogleAccount() async {
+        stopActiveWakeProcess()
         stopKeepaliveDaemon()
         _ = await runBridgeCommand(["auth_logout"], installIfMissing: false)
         cliLoggedIn = false
@@ -264,12 +286,51 @@ extension StudioViewModel {
         }
     }
 
+    func stopActiveWakeProcess() {
+        if let proc = activeWakeProcess, proc.isRunning {
+            proc.terminate()
+        }
+        activeWakeProcess = nil
+    }
+
+    func handleWakeOutputLine(_ line: String, gpu: String, password: String) {
+        if line.hasPrefix("WAKE_URL:") {
+            let url = String(line.dropFirst("WAKE_URL:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            self.colabServerURL = url
+            self.adminPassword = password
+            self.wakeObtainedURLThisRun = true
+            self.liveConsoleLines.append(L(
+                "成功获取云端隧道地址: \(self.maskedURLDisplay(url))",
+                "Obtained public tunnel URL: \(self.maskedURLDisplay(url))"
+            ))
+            self.statusMessage = L(
+                "云端 \(gpu) 实例已唤醒就绪，正在同步模型状态...",
+                "Cloud \(gpu) instance is ready. Syncing model status..."
+            )
+        } else if line.hasPrefix("WAKE_ERROR:") {
+            let errBody = String(line.dropFirst("WAKE_ERROR:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayErr = errBody.isEmpty ? line : errBody
+            self.liveConsoleLines.append(displayErr)
+            self.statusMessage = L("唤醒失败: \(displayErr)", "Wake failed: \(displayErr)")
+        } else if line.hasPrefix("WAKE_LOG:") {
+            let clean = String(line.dropFirst("WAKE_LOG:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty {
+                self.liveConsoleLines.append(clean)
+                self.statusMessage = clean
+            }
+        } else if !line.hasPrefix("[colab]") && !line.contains("Assignment request failed") && !line.contains("urllib3") {
+            self.liveConsoleLines.append(line)
+        }
+    }
+
     func wakeColabHeadless() async {
         guard cliLoggedIn else {
             statusMessage = L("请先绑定 Google 账号后再使用免网页一键唤醒。", "Please bind your Google account before using headless 1-click wake.")
             return
         }
+        stopActiveWakeProcess()
         stopKeepaliveDaemon()
+        wakeObtainedURLThisRun = false
         isWakingColab = true
         statusMessage = L(
             "正在通过 Google Colab API 后台分配 \(wakeGPUChoice) 实例并部署多模型引擎...",
@@ -289,48 +350,31 @@ extension StudioViewModel {
         let password = UUID().uuidString + UUID().uuidString
         let idleMin = self.idleTimeoutMinutes
         let appPy = self.appPyPath
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: pyBin)
+        proc.environment = ProcessInfo.processInfo.environment.merging([
+            "EASYCOLAB_ADMIN_PASSWORD": password,
+            "EASYCOLAB_IDLE_TIMEOUT_MINUTES": "\(idleMin)"
+        ]) { _, new in new }
+        proc.arguments = [script, "wake", "--gpu", gpu, "--app-py", appPy]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        self.activeWakeProcess = proc
+
+        let lineBuffer = KeepalivePipeLineBuffer()
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: pyBin)
-                proc.environment = ProcessInfo.processInfo.environment.merging([
-                    "EASYCOLAB_ADMIN_PASSWORD": password,
-                    "EASYCOLAB_IDLE_TIMEOUT_MINUTES": "\(idleMin)"
-                ]) { _, new in new }
-                proc.arguments = [script, "wake", "--gpu", gpu, "--app-py", appPy]
-                let pipe = Pipe()
-                proc.standardOutput = pipe
-                proc.standardError = pipe
-
-                pipe.fileHandleForReading.readabilityHandler = { handle in
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                     let data = handle.availableData
-                    guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-                    let lines = chunk.components(separatedBy: .newlines)
-                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                        .filter { !$0.isEmpty }
-                    Task { @MainActor in
+                    guard !data.isEmpty else { return }
+                    let lines = lineBuffer.appendAndExtractLines(data)
+                    guard !lines.isEmpty else { return }
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
                         for line in lines {
-                            if line.hasPrefix("WAKE_URL:") {
-                                let url = String(line.dropFirst("WAKE_URL:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                                self.colabServerURL = url
-                                self.adminPassword = password
-                                self.liveConsoleLines.append(L(
-                                    "成功获取云端隧道地址: \(self.maskedURLDisplay(url))",
-                                    "Obtained public tunnel URL: \(self.maskedURLDisplay(url))"
-                                ))
-                                self.statusMessage = L(
-                                    "云端 \(gpu) 实例已唤醒就绪，正在同步模型状态...",
-                                    "Cloud \(gpu) instance is ready. Syncing model status..."
-                                )
-                            } else if line.hasPrefix("WAKE_ERROR:") {
-                                self.liveConsoleLines.append(line)
-                                self.statusMessage = L("唤醒失败: \(line)", "Wake failed: \(line)")
-                            } else {
-                                let clean = line.replacingOccurrences(of: "WAKE_LOG: ", with: "")
-                                self.liveConsoleLines.append(clean)
-                                self.statusMessage = clean
-                            }
+                            self.handleWakeOutputLine(line, gpu: gpu, password: password)
                         }
                     }
                 }
@@ -339,7 +383,8 @@ extension StudioViewModel {
                     try proc.run()
                     proc.waitUntilExit()
                 } catch {
-                    Task { @MainActor in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
                         self.statusMessage = L(
                             "启动唤醒进程失败: \(error.localizedDescription)",
                             "Failed to launch wake process: \(error.localizedDescription)"
@@ -347,13 +392,29 @@ extension StudioViewModel {
                     }
                 }
                 pipe.fileHandleForReading.readabilityHandler = nil
-                continuation.resume()
+                let tailData = pipe.fileHandleForReading.readDataToEndOfFile()
+                var finalLines = lineBuffer.appendAndExtractLines(tailData)
+                if let rem = lineBuffer.flushRemainingLine() {
+                    finalLines.append(rem)
+                }
+                let capturedFinal = finalLines
+                Task { @MainActor [weak self] in
+                    if let self {
+                        for line in capturedFinal {
+                            self.handleWakeOutputLine(line, gpu: gpu, password: password)
+                        }
+                    }
+                    continuation.resume()
+                }
             }
         }
 
+        if self.activeWakeProcess === proc {
+            self.activeWakeProcess = nil
+        }
         isWakingColab = false
         await refreshOfficialColabAccountUsage()
-        if !colabServerURL.isEmpty {
+        if wakeObtainedURLThisRun && !colabServerURL.isEmpty {
             await checkColabStatus()
             await ensureKeepaliveDaemonRunning()
         }

@@ -10,6 +10,8 @@ Supports:
   - keepalive   : Refresh Colab runtime proxy & kernel activity while active
   - stop_all    : Unassign and terminate all active Colab VMs on the account (verify 0 CU/hr burn)
 """
+from __future__ import annotations
+
 import os
 import re
 import sys
@@ -86,10 +88,20 @@ def _sync_macos_system_proxies_to_env():
 
 
 _sync_macos_system_proxies_to_env()
+os.environ.setdefault("COLAB_CLI_REQUEST_TIMEOUT", "75")
 
 from colab_cli.auth import PUBLIC_SCOPES, TOKEN_CONFIG_PATH, REMOTE_REDIRECT_URI
 from colab_cli.common import state
-from colab_cli.client import Accelerator, Variant, Shape, resolve_assign_shape, PostAssignmentResponse, ColabRequestError
+from colab_cli.client import (
+    Accelerator,
+    Variant,
+    Shape,
+    resolve_assign_shape,
+    PostAssignmentResponse,
+    ColabRequestError,
+    TooManyAssignmentsError,
+)
+from colab_cli.utils import get_status_code
 from colab_cli.state import SessionState
 from colab_cli.runtime import ColabRuntime
 from colab_cli.contents import ContentsClient
@@ -235,6 +247,8 @@ def _safe_sync_sessions():
     for attempt in range(3):
         try:
             with _quiet_colab_cli():
+                # 重置 colab_cli 进程内缓存，确保每次都重新读取 sessions.json 并对比云端最新分配
+                state._sessions = None
                 return state.sync_sessions()
         except Exception:
             if attempt == 2:
@@ -331,15 +345,50 @@ def _build_rclone_drive_conf() -> str:
         return ""
 
 
+def _unassign_endpoints_and_wait_quota_release(endpoints: list[str], wait_s: float = 8.0) -> int:
+    """
+    去重释放指定云端 endpoint 列表，并轮询 list_assignments 等待 Google 配额账本真正注销这些实例。
+    避免前脚刚调 unassign、后脚立刻调 assign 时因 Google 后端秒级延迟导致 G4/H100 配额仍显示占用而报 503/412。
+    """
+    unique_eps = []
+    seen = set()
+    for ep in endpoints:
+        if ep and ep not in seen:
+            seen.add(ep)
+            unique_eps.append(ep)
+    if not unique_eps:
+        return 0
+
+    stopped_count = 0
+    for ep in unique_eps:
+        try:
+            state.client.unassign(ep)
+            stopped_count += 1
+        except Exception:
+            pass
+
+    if wait_s > 0:
+        deadline = time.time() + wait_s
+        target_set = set(unique_eps)
+        while time.time() < deadline:
+            try:
+                remaining = {a.endpoint for a in state.client.list_assignments()}
+                if not (remaining & target_set):
+                    break
+            except Exception:
+                break
+            time.sleep(1.5)
+    return stopped_count
+
+
 def cmd_stop_all():
     if not _has_valid_token():
         print(json.dumps({"ok": False, "error": "尚未登录 Google Colab CLI"}))
         return
 
     try:
-        with _quiet_colab_cli():
-            local_sessions, assignments = state.sync_sessions()
-        stopped_count = 0
+        local_sessions, assignments = _safe_sync_sessions()
+        endpoints_to_release: list[str] = []
         for s in list(local_sessions.values()):
             try:
                 with _quiet_colab_cli():
@@ -361,21 +410,17 @@ def cmd_stop_all():
                     rt.stop(shutdown_kernel=True)
             except Exception:
                 pass
-            try:
-                state.client.unassign(s.endpoint)
-                stopped_count += 1
-            except Exception:
-                pass
+            if getattr(s, "endpoint", None):
+                endpoints_to_release.append(s.endpoint)
             with _quiet_colab_cli():
                 state.store.remove(s.name)
 
-        # 同时清理所有未在本地登记的云端孤儿实例 (Orphan VMs)
+        # 同时清理所有未在本地登记的云端孤儿实例 (Orphan VMs)，去重并等待配额归零
         for a in assignments:
-            try:
-                state.client.unassign(a.endpoint)
-                stopped_count += 1
-            except Exception:
-                pass
+            if getattr(a, "endpoint", None):
+                endpoints_to_release.append(a.endpoint)
+
+        stopped_count = _unassign_endpoints_and_wait_quota_release(endpoints_to_release, wait_s=8.0)
 
         info = state.client.get_consumption_user_info()
         print(json.dumps({
@@ -431,27 +476,177 @@ GPU_ACCEL_MAP = {
     "t4": Accelerator.T4,
 }
 
-# G4 (RTX PRO 6000 Blackwell 96GB)、H100、L4 在 Colab 后端均为固定单规格大内存实例，传 shape=hm 会报 400 Bad Request
-SINGLE_SHAPE_GPUS = frozenset({Accelerator.G4, Accelerator.H100, Accelerator.L4})
-
 
 def _resolve_gpu_accel(gpu_type: str) -> Accelerator:
     return GPU_ACCEL_MAP.get((gpu_type or "g4").strip().lower(), Accelerator.G4)
 
 
+def _gpu_display_label(accel: Accelerator) -> str:
+    if accel == Accelerator.G4:
+        return "G4 (RTX PRO 6000 · 96GB)"
+    return accel.value
+
+
+def _candidate_shapes_for_accel(accel: Accelerator) -> list:
+    """
+    为各型号 GPU 提供主备机器内存规格 (Shape) 候选序列：
+    - G4 / H100：首选不传 shape (默认大内存标准池，避免部分区域对 shape=hm 报 400)，若遇 503 库存不足自动尝试 HIGH_RAM 池；
+    - A100 / T4：首选 HIGH_RAM 大内存池，若遇 400/503 自动降级尝试标准内存池；
+    - L4：官方固定单规格 (HIGH_MEM_ONLY_ACCELERATORS)，仅使用 None。
+    """
+    if accel == Accelerator.L4:
+        return [None]
+    if accel in (Accelerator.G4, Accelerator.H100):
+        return [None, Shape.HIGH_RAM]
+    primary = resolve_assign_shape(accel, high_mem=True)
+    return [primary, None] if primary is not None else [None]
+
+
+def _session_from_listed_assignment(a, session_name: str = "easycolab", existing: SessionState | None = None) -> SessionState:
+    return SessionState(
+        name=existing.name if existing and getattr(existing, "name", None) else session_name,
+        token=a.runtime_proxy_info.token,
+        url=a.runtime_proxy_info.url,
+        endpoint=a.endpoint,
+        token_expires_at=a.runtime_proxy_info.expires_at(),
+        kernel_id=getattr(existing, "kernel_id", None) if existing and existing.endpoint == a.endpoint else None,
+        session_id=(
+            getattr(existing, "session_id", None)
+            if existing and existing.endpoint == a.endpoint and getattr(existing, "session_id", None)
+            else uuid.uuid4().hex
+        ),
+        variant=Variant.GPU.value,
+        accelerator=a.accelerator.value,
+        machine_shape=Shape.HIGH_RAM.name if a.machine_shape == Shape.HIGH_RAM else Shape.STANDARD.name,
+    )
+
+
+def _try_adopt_matching_cloud_assignment(accel: Accelerator, session_name: str = "easycolab") -> SessionState | None:
+    """
+    当 POST /tun/m/assign 出现网关 504 / ReadTimeout / 503 重试时，立即核对云端真实 list_assignments()：
+    若 Google 后端实际上已在后台完成该型号机器分配，直接纳管返回，杜绝产生孤儿机器占满高配 GPU 名额。
+    """
+    try:
+        assignments = state.client.list_assignments()
+    except Exception:
+        return None
+    for a in assignments:
+        if a.accelerator == accel:
+            s = _session_from_listed_assignment(a, session_name=session_name)
+            with _quiet_colab_cli():
+                state.store.add(s)
+            return s
+    return None
+
+
+@contextlib.contextmanager
+def _single_shot_colab_assign():
+    """禁用 colab_cli 内部静默阻塞 70 秒的英文重试循环，交由 EasyColab 透明重试并实时对账云端分配"""
+    prev_retries = os.environ.get("COLAB_CLI_ASSIGN_RETRIES")
+    os.environ["COLAB_CLI_ASSIGN_RETRIES"] = "0"
+    try:
+        yield
+    finally:
+        if prev_retries is None:
+            os.environ.pop("COLAB_CLI_ASSIGN_RETRIES", None)
+        else:
+            os.environ["COLAB_CLI_ASSIGN_RETRIES"] = prev_retries
+
+
 def _allocate_fresh_session(session_name: str, gpu_type: str) -> SessionState:
     accel = _resolve_gpu_accel(gpu_type)
-    shape = None if accel in SINGLE_SHAPE_GPUS else resolve_assign_shape(accel, high_mem=True)
-    gpu_desc = "G4 (RTX PRO 6000 · 96GB)" if accel == Accelerator.G4 else accel.value
+    gpu_desc = _gpu_display_label(accel)
+    shape_candidates = list(_candidate_shapes_for_accel(accel))
+    rejected_400_shapes = set()
+    nbh_by_shape = {sh: uuid.uuid4() for sh in shape_candidates}
+
     print(f"WAKE_LOG: 🚀 正在向 Google Colab 申请分配 {gpu_desc} 实例...", flush=True)
-    try:
-        res = state.client.assign(uuid.uuid4(), variant=Variant.GPU, accelerator=accel, shape=shape)
-    except ColabRequestError as req_err:
-        if shape is not None and getattr(getattr(req_err, "response", None), "status_code", None) == 400:
-            shape = None
-            res = state.client.assign(uuid.uuid4(), variant=Variant.GPU, accelerator=accel, shape=None)
-        else:
-            raise
+
+    max_attempts = 3
+    retry_delays = [6.0, 10.0]
+    attempt = 0
+    shape_idx = 0
+    cleaned_412_orphans = False
+    last_err_tag = "HTTP 503"
+    res = None
+    chosen_shape = shape_candidates[0]
+
+    while attempt < max_attempts:
+        valid_shapes = [sh for sh in shape_candidates if sh not in rejected_400_shapes] or [None]
+        chosen_shape = valid_shapes[shape_idx % len(valid_shapes)]
+        nbh = nbh_by_shape.setdefault(chosen_shape, uuid.uuid4())
+
+        try:
+            with _quiet_colab_cli(), _single_shot_colab_assign():
+                res = state.client.assign(nbh, variant=Variant.GPU, accelerator=accel, shape=chosen_shape)
+            break
+        except TooManyAssignmentsError as quota_err:
+            adopted = _try_adopt_matching_cloud_assignment(accel, session_name=session_name)
+            if adopted is not None:
+                print(f"WAKE_LOG: ✅ 检测到云端已在后台完成 {accel.value} 实例分配，直接接管！", flush=True)
+                return adopted
+            if not cleaned_412_orphans:
+                cleaned_412_orphans = True
+                try:
+                    lingering = [a.endpoint for a in state.client.list_assignments() if a.endpoint]
+                except Exception:
+                    lingering = []
+                if lingering:
+                    print("WAKE_LOG: 🧹 检测到账号下残留未释放实例占用并发名额，正在自动清理后重试...", flush=True)
+                    _unassign_endpoints_and_wait_quota_release(lingering, wait_s=8.0)
+                    continue
+            raise RuntimeError(
+                f"Google Colab 拒绝分配 {gpu_desc} (HTTP 412)：当前账号并发实例数已达上限，或该时段高配机型触发临时配额限制。"
+                f"请确认未在其他浏览器标签页占用实例，稍后重试或临时切换为 A100 / L4。"
+            ) from quota_err
+        except (ColabRequestError, requests.exceptions.RequestException) as req_err:
+            status = get_status_code(req_err) if isinstance(req_err, ColabRequestError) else None
+
+            # 1) 无论报 504/503/ReadTimeout，第一时间检查云端是否其实已经分配成功
+            adopted = _try_adopt_matching_cloud_assignment(accel, session_name=session_name)
+            if adopted is not None:
+                print(f"WAKE_LOG: ✅ 检测到云端已在后台完成 {accel.value} 实例分配，直接接管！", flush=True)
+                return adopted
+
+            # 2) 若当前机器规格报 400 Bad Request（如部分池不支持 shape=hm），立即切换候选规格且不消耗重试次数
+            if status == 400 and chosen_shape is not None and None not in rejected_400_shapes:
+                rejected_400_shapes.add(chosen_shape)
+                shape_idx = 0
+                continue
+            if status == 400:
+                raise RuntimeError(
+                    f"Google Colab 后端拒绝分配 {gpu_desc} (HTTP 400)：当前账号订阅等级可能暂不支持该机型或可用计算单元不足，"
+                    f"建议切换为 A100 / L4 / T4 实例。"
+                ) from req_err
+
+            retryable = isinstance(req_err, requests.exceptions.RequestException) or status in (429, 500, 502, 503, 504)
+            if not retryable:
+                raise
+
+            last_err_tag = f"HTTP {status}" if status else type(req_err).__name__
+            attempt += 1
+            shape_idx += 1
+            if attempt >= max_attempts:
+                break
+
+            delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+            print(
+                f"WAKE_LOG: ⏳ Google Colab 当前区域 {gpu_desc} 算力池繁忙 ({last_err_tag})，"
+                f"{delay:.0f} 秒后进行第 {attempt + 1}/{max_attempts} 次申请...",
+                flush=True,
+            )
+            time.sleep(delay)
+            adopted_after_wait = _try_adopt_matching_cloud_assignment(accel, session_name=session_name)
+            if adopted_after_wait is not None:
+                print(f"WAKE_LOG: ✅ 检测到云端已完成 {accel.value} 实例分配，直接接管！", flush=True)
+                return adopted_after_wait
+
+    if res is None:
+        raise RuntimeError(
+            f"Google Colab 云端当前时段 {gpu_desc} 算力池库存不足 ({last_err_tag})，连续 {max_attempts} 次申请均未分到机器"
+            f"（属于 Colab 官方高配机型时段性缺货，非本地客户端故障）。建议稍等几分钟再试，或在左侧临时切换为 A100 / L4 实例。"
+        )
+
     if isinstance(res, PostAssignmentResponse):
         token = res.runtime_proxy_info.token
         url = res.runtime_proxy_info.url
@@ -469,11 +664,13 @@ def _allocate_fresh_session(session_name: str, gpu_type: str) -> SessionState:
         url=url,
         endpoint=endpoint,
         token_expires_at=exp,
+        session_id=uuid.uuid4().hex,
         variant=Variant.GPU.value,
         accelerator=accel.value,
-        machine_shape=Shape.HIGH_RAM.name if shape == Shape.HIGH_RAM else Shape.STANDARD.name,
+        machine_shape=Shape.HIGH_RAM.name if chosen_shape == Shape.HIGH_RAM else Shape.STANDARD.name,
     )
-    state.store.add(s)
+    with _quiet_colab_cli():
+        state.store.add(s)
     print(f"WAKE_LOG: ✅ 成功分配 {accel.value} 云端虚拟机！正在等待容器内核就绪...", flush=True)
     return s
 
@@ -481,7 +678,8 @@ def _allocate_fresh_session(session_name: str, gpu_type: str) -> SessionState:
 def cmd_wake(gpu_type: str, app_py_path: str):
     """
     无浏览器一键唤醒 Colab GPU 并自动部署 EasyColab 多模型服务端：
-    1. 幂等检查：若已有运行中的会话且探活成功则直接复用，否则自动清理失效会话并分配新实例
+    1. 全量云端分配对账：遍历账号下全部云端 assignments（含未在本地登记的孤儿实例），优先复用同型号健康实例，
+       并彻底释放异构/残留孤儿实例且等待配额归零，杜绝孤儿机器占满 G4/H100 单实例配额导致 503/412
     2. 等待容器 Jupyter 端点 (/api/kernels) TLS/HTTP 握手就绪，规避 SSLEOFError
     3. 上传本地最新 app.py 到 /content/app.py
     4. 在远端内核安装依赖并后台拉起 app.py，提取 https://xxxx.gradio.live 隧道链接返回给 Mac 客户端
@@ -505,61 +703,78 @@ def cmd_wake(gpu_type: str, app_py_path: str):
 
     try:
         session_name = "easycolab"
+        requested_accel = _resolve_gpu_accel(gpu_type)
         print("WAKE_LOG: 🔍 正在检查账号下已有的 Colab 实例...", flush=True)
         local_sessions, assignments = _safe_sync_sessions()
+        ep_to_local = {
+            s.endpoint: s for s in local_sessions.values() if getattr(s, "endpoint", None)
+        }
 
-        target_session = (
+        preferred_local = (
             local_sessions.get(session_name)
             or local_sessions.get("aevix")
             or local_sessions.get("minimax")
+            or (list(local_sessions.values())[0] if local_sessions else None)
         )
-        if target_session:
-            session_name = target_session.name
-        elif local_sessions:
-            target_session = list(local_sessions.values())[0]
-            session_name = target_session.name
+        if preferred_local and getattr(preferred_local, "name", None):
+            session_name = preferred_local.name
 
-        # 若本地未记录但云端已有活跃分配，直接纳管该云端实例
-        if not target_session and assignments:
-            a = assignments[0]
-            target_session = SessionState(
-                name=session_name,
-                token=a.runtime_proxy_info.token,
-                url=a.runtime_proxy_info.url,
-                endpoint=a.endpoint,
-                token_expires_at=a.runtime_proxy_info.expires_at(),
-                variant=Variant.GPU.value,
-                accelerator=a.accelerator.value,
-                machine_shape=Shape.HIGH_RAM.name if a.machine_shape == Shape.HIGH_RAM else Shape.STANDARD.name,
+        target_session: SessionState | None = None
+        matching_assignments = [a for a in assignments if a.accelerator == requested_accel]
+        other_assignments = [a for a in assignments if a.accelerator != requested_accel]
+        dead_matching_eps: list[str] = []
+
+        # 1) 优先在账号全部云端活跃分配中查找与目标 GPU 型号一致的健康实例（包含此前超时遗留但实际已创建成功的孤儿实例）
+        for a in matching_assignments:
+            existing_local = ep_to_local.get(a.endpoint)
+            candidate = _session_from_listed_assignment(a, session_name=session_name, existing=existing_local)
+            print(
+                f"WAKE_LOG: ♻️ 正在检查已有实例 [{candidate.name}] ({a.accelerator.value}) 连通性...",
+                flush=True,
             )
-            state.store.add(target_session)
+            if _wait_for_runtime_ready(candidate, timeout_s=18):
+                target_session = candidate
+                with _quiet_colab_cli():
+                    state.store.add(target_session)
+                break
+            else:
+                print(f"WAKE_LOG: ⚠️ 旧实例 ({a.endpoint[:18]}...) 已失效或正在销毁，准备清理...", flush=True)
+                dead_matching_eps.append(a.endpoint)
 
-        requested_accel = _resolve_gpu_accel(gpu_type)
-        if target_session:
-            cur_acc = (target_session.accelerator or "").strip().upper()
-            if cur_acc != requested_accel.value.upper():
+        if target_session is not None:
+            # 已复用目标型号实例：顺带释放重复同型号孤儿实例及本地记录过的旧异构实例，防止双倍扣费
+            extra_eps = list(dead_matching_eps)
+            for a in matching_assignments:
+                if a.endpoint != target_session.endpoint:
+                    extra_eps.append(a.endpoint)
+            for s in list(local_sessions.values()):
+                if s.endpoint and s.endpoint != target_session.endpoint:
+                    extra_eps.append(s.endpoint)
+                if s.name != target_session.name:
+                    with _quiet_colab_cli():
+                        state.prune_session(s.name)
+            if extra_eps:
+                _unassign_endpoints_and_wait_quota_release(extra_eps, wait_s=5.0)
+        else:
+            # 2) 未找到可复用的目标型号实例：释放账号下占用的旧型号/失效孤儿实例并等待配额账本归零，再申请新机器
+            release_eps = list(dead_matching_eps) + [a.endpoint for a in other_assignments if a.endpoint]
+            for s in list(local_sessions.values()):
+                if getattr(s, "endpoint", None):
+                    release_eps.append(s.endpoint)
+                with _quiet_colab_cli():
+                    state.prune_session(s.name)
+
+            if release_eps:
+                old_labels = sorted({a.accelerator.value for a in other_assignments} | (
+                    {requested_accel.value} if dead_matching_eps else set()
+                ))
+                label_str = " / ".join(old_labels) if old_labels else "旧实例"
                 print(
-                    f"WAKE_LOG: 🔄 当前已分配实例型号为 [{cur_acc or 'CPU'}]，正在释放并切换为您选择的 [{requested_accel.value}]...",
+                    f"WAKE_LOG: 🔄 当前已占用实例 [{label_str}]，正在彻底释放并等待配额就绪以切换为 [{requested_accel.value}]...",
                     flush=True,
                 )
-                try:
-                    state.client.unassign(target_session.endpoint)
-                except Exception:
-                    pass
-                state.prune_session(target_session.name)
-                target_session = None
-            else:
-                print(f"WAKE_LOG: ♻️ 正在检查已有实例 [{target_session.name}] ({target_session.accelerator}) 连通性...", flush=True)
-                if not _wait_for_runtime_ready(target_session, timeout_s=15):
-                    print("WAKE_LOG: ⚠️ 旧实例已失效或正在销毁，正在自动清理并重新分配新实例...", flush=True)
-                    try:
-                        state.client.unassign(target_session.endpoint)
-                    except Exception:
-                        pass
-                    state.prune_session(target_session.name)
-                    target_session = None
+                _unassign_endpoints_and_wait_quota_release(release_eps, wait_s=8.0)
 
-        if not target_session:
             target_session = _allocate_fresh_session(session_name, gpu_type)
             if not _wait_for_runtime_ready(target_session, timeout_s=50):
                 print("WAKE_LOG: ⏳ 容器仍在初始化，继续尝试连接内核...", flush=True)

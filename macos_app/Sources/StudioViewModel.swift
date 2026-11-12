@@ -431,6 +431,8 @@ class StudioViewModel: ObservableObject {
 
     // macOS 防 App Nap 休眠断言与常驻外部 Runtime Proxy 保活守护进程状态
     var runtimeActivityToken: NSObjectProtocol? = nil
+    var activeWakeProcess: Process? = nil
+    var wakeObtainedURLThisRun: Bool = false
     var keepaliveDaemonProcess: Process? = nil
     var keepaliveDaemonStdinPipe: Pipe? = nil
     var keepaliveDaemonStdoutPipe: Pipe? = nil
@@ -700,6 +702,7 @@ class StudioViewModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
+                self?.stopActiveWakeProcess()
                 self?.stopKeepaliveDaemon()
             }
         }
@@ -1582,6 +1585,7 @@ class StudioViewModel: ObservableObject {
     }
 
     func disconnectRemoteColab() async {
+        stopActiveWakeProcess()
         stopKeepaliveDaemon()
         statusMessage = L(
             "正在释放云端 Colab 实例并同步账户计费状态...",
