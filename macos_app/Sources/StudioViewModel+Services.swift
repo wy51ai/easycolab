@@ -6,6 +6,28 @@ import ObjectiveC.runtime
 
 // MARK: - StudioViewModel 扩展：Google OAuth 桥接、自定义 HF 模型热榜与详情、ComfyUI 与网关同步
 
+final class KeepalivePipeLineBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = Data()
+
+    func appendAndExtractPayloads(_ chunk: Data) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        pending.append(chunk)
+        var payloads: [String] = []
+        while let nlIdx = pending.firstIndex(of: 0x0A) {
+            let lineData = pending.subdata(in: 0..<nlIdx)
+            pending.removeSubrange(0...nlIdx)
+            if let lineStr = String(data: lineData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               lineStr.hasPrefix("KEEPALIVE_JSON:") {
+                payloads.append(String(lineStr.dropFirst("KEEPALIVE_JSON:".count)))
+            }
+        }
+        return payloads
+    }
+}
+
 extension StudioViewModel {
     // MARK: - 本地 colab_bridge.py 交互与零配置环境自举
     func ensureBridgePythonBin(installIfMissing: Bool) async -> String? {
@@ -98,6 +120,19 @@ extension StudioViewModel {
         }
     }
 
+    nonisolated static func extractJSONPayload(from rawOutput: String) -> String {
+        let trimmed = rawOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let lines = trimmed.components(separatedBy: .newlines)
+        for line in lines.reversed() {
+            let candidate = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if candidate.hasPrefix("{") && candidate.hasSuffix("}") {
+                return candidate
+            }
+        }
+        return trimmed
+    }
+
     func runBridgeCommand(_ args: [String], installIfMissing: Bool = false) async -> String {
         guard let pyBin = await ensureBridgePythonBin(installIfMissing: installIfMissing) else {
             return ""
@@ -108,15 +143,15 @@ extension StudioViewModel {
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: pyBin)
                 proc.arguments = [script] + args
-                let pipe = Pipe()
-                proc.standardOutput = pipe
-                proc.standardError = pipe
+                let outPipe = Pipe()
+                proc.standardOutput = outPipe
+                proc.standardError = FileHandle.nullDevice
                 do {
                     try proc.run()
+                    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
                     proc.waitUntilExit()
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
                     let out = String(data: data, encoding: .utf8) ?? ""
-                    continuation.resume(returning: out.trimmingCharacters(in: .whitespacesAndNewlines))
+                    continuation.resume(returning: Self.extractJSONPayload(from: out))
                 } catch {
                     continuation.resume(returning: "")
                 }
@@ -172,6 +207,7 @@ extension StudioViewModel {
     }
 
     func logoutGoogleAccount() async {
+        stopKeepaliveDaemon()
         _ = await runBridgeCommand(["auth_logout"], installIfMissing: false)
         cliLoggedIn = false
         accountEmail = ""
@@ -233,6 +269,7 @@ extension StudioViewModel {
             statusMessage = L("请先绑定 Google 账号后再使用免网页一键唤醒。", "Please bind your Google account before using headless 1-click wake.")
             return
         }
+        stopKeepaliveDaemon()
         isWakingColab = true
         statusMessage = L(
             "正在通过 Google Colab API 后台分配 \(wakeGPUChoice) 实例并部署多模型引擎...",
@@ -250,13 +287,17 @@ extension StudioViewModel {
         let script = self.bridgeScript
         let gpu = self.wakeGPUChoice
         let password = UUID().uuidString + UUID().uuidString
+        let idleMin = self.idleTimeoutMinutes
         let appPy = self.appPyPath
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: pyBin)
-                proc.environment = ProcessInfo.processInfo.environment.merging(["EASYCOLAB_ADMIN_PASSWORD": password]) { _, new in new }
+                proc.environment = ProcessInfo.processInfo.environment.merging([
+                    "EASYCOLAB_ADMIN_PASSWORD": password,
+                    "EASYCOLAB_IDLE_TIMEOUT_MINUTES": "\(idleMin)"
+                ]) { _, new in new }
                 proc.arguments = [script, "wake", "--gpu", gpu, "--app-py", appPy]
                 let pipe = Pipe()
                 proc.standardOutput = pipe
@@ -314,11 +355,121 @@ extension StudioViewModel {
         await refreshOfficialColabAccountUsage()
         if !colabServerURL.isEmpty {
             await checkColabStatus()
+            await ensureKeepaliveDaemonRunning()
+        }
+    }
+
+    func stopKeepaliveDaemon() {
+        keepaliveDaemonStdoutPipe?.fileHandleForReading.readabilityHandler = nil
+        try? keepaliveDaemonStdinPipe?.fileHandleForWriting.close()
+        if let proc = keepaliveDaemonProcess, proc.isRunning {
+            proc.terminate()
+        }
+        keepaliveDaemonProcess = nil
+        keepaliveDaemonStdinPipe = nil
+        keepaliveDaemonStdoutPipe = nil
+        keepaliveProxyWSConnected = false
+    }
+
+    func handleKeepaliveDaemonPayloadLine(_ jsonLine: String) {
+        guard let data = jsonLine.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(BridgeAuthStatusResponse.self, from: data) else {
+            return
+        }
+        if let logged = decoded.logged_in {
+            cliLoggedIn = logged
+        }
+        if let wsConn = decoded.ws_connected {
+            keepaliveProxyWSConnected = wsConn
+        }
+        if let bal = decoded.paid_balance {
+            officialCUBalance = bal
+            totalBudgetCU = bal
+        }
+        if let rate = decoded.burn_rate_hourly {
+            officialBurnRate = rate
+        }
+        if let count = decoded.active_assignments {
+            activeVMCount = count
+        }
+    }
+
+    func ensureKeepaliveDaemonRunning() async {
+        guard cliLoggedIn, isConnected, !isWakingColab else { return }
+        if let existing = keepaliveDaemonProcess, existing.isRunning {
+            return
+        }
+        guard !isStartingKeepaliveDaemon else { return }
+        isStartingKeepaliveDaemon = true
+        defer { isStartingKeepaliveDaemon = false }
+
+        guard let pyBin = await ensureBridgePythonBin(installIfMissing: false) else { return }
+        guard cliLoggedIn, isConnected, !isWakingColab else { return }
+        if let existing = keepaliveDaemonProcess, existing.isRunning {
+            return
+        }
+
+        stopKeepaliveDaemon()
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: pyBin)
+        proc.arguments = [self.bridgeScript, "keepalive_daemon"]
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        proc.standardInput = stdinPipe
+        proc.standardOutput = stdoutPipe
+        proc.standardError = FileHandle.nullDevice
+
+        let lineBuffer = KeepalivePipeLineBuffer()
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            let completeLines = lineBuffer.appendAndExtractPayloads(chunk)
+
+            if !completeLines.isEmpty {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    for payload in completeLines {
+                        self.handleKeepaliveDaemonPayloadLine(payload)
+                    }
+                }
+            }
+        }
+
+        proc.terminationHandler = { [weak self] exitedProc in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.keepaliveDaemonProcess === exitedProc {
+                    self.keepaliveDaemonStdoutPipe?.fileHandleForReading.readabilityHandler = nil
+                    try? self.keepaliveDaemonStdinPipe?.fileHandleForWriting.close()
+                    self.keepaliveDaemonProcess = nil
+                    self.keepaliveDaemonStdinPipe = nil
+                    self.keepaliveDaemonStdoutPipe = nil
+                    self.keepaliveProxyWSConnected = false
+                }
+            }
+        }
+
+        do {
+            try proc.run()
+            self.keepaliveDaemonProcess = proc
+            self.keepaliveDaemonStdinPipe = stdinPipe
+            self.keepaliveDaemonStdoutPipe = stdoutPipe
+        } catch {
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            try? stdinPipe.fileHandleForWriting.close()
         }
     }
 
     func keepaliveColabRuntime() async {
         guard cliLoggedIn, !isWakingColab else { return }
+        if isConnected {
+            await ensureKeepaliveDaemonRunning()
+            if keepaliveDaemonProcess?.isRunning == true {
+                return
+            }
+        }
         let out = await runBridgeCommand(["keepalive"])
         guard let data = out.data(using: .utf8),
               let decoded = try? JSONDecoder().decode(BridgeAuthStatusResponse.self, from: data) else {
@@ -347,29 +498,23 @@ extension StudioViewModel {
                     if !isGenerating || tick % 6 == 0 {
                         await checkColabStatus(silent: true)
                     }
-                } else if !normalizedBaseURL.isEmpty && tick % 4 == 0 {
-                    await checkColabStatus(silent: true)
+                    if cliLoggedIn && !isWakingColab {
+                        await ensureKeepaliveDaemonRunning()
+                    }
+                } else {
+                    if keepaliveDaemonProcess != nil {
+                        stopKeepaliveDaemon()
+                    }
+                    if !normalizedBaseURL.isEmpty && tick % 4 == 0 {
+                        await checkColabStatus(silent: true)
+                    }
                 }
 
-                // 每 ~80 秒：若处于生成任务或活跃保活窗口内，向 Colab 官方 Runtime Proxy 发送轻量保活脉冲，杜绝生成第 2 条视频中途被回收
-                if tick % 32 == 0 && cliLoggedIn && !isWakingColab {
-                    let shouldKeepalive = isConnected && (
-                        isGenerating
-                        || isDownloadingWeights
-                        || isLoadingModel
-                        || comfyStarting
-                        || comfyDownloadingWeight
-                        || comfyQueueRunning > 0
-                        || idleTimeoutMinutes <= 0
-                        || idleRemainingSeconds > 75
-                    )
-                    if shouldKeepalive {
-                        await keepaliveColabRuntime()
-                    } else {
-                        await refreshOfficialColabAccountUsage()
-                    }
-                } else if tick % 16 == 0 && cliLoggedIn && !isConnected {
+                // 未连接云端实例时每 ~40s 低频刷新一次官方 CU 余额与活跃分配数；已连接时由常驻 keepalive_daemon 实时回传
+                if tick % 16 == 0 && cliLoggedIn && !isWakingColab && !isConnected {
                     await refreshOfficialColabAccountUsage()
+                } else if tick % 24 == 0 && cliLoggedIn && !isWakingColab && isConnected && keepaliveDaemonProcess?.isRunning != true {
+                    await keepaliveColabRuntime()
                 }
             }
         }
@@ -472,9 +617,11 @@ extension StudioViewModel {
         currentModelName = decoded.current_model ?? L(Self.defaultModelNameZh, Self.defaultModelNameEn)
         loadedContextLengthTokens = decoded.loaded_context_length ?? 0
 
-        if !remoteContextSynced {
-            remoteContextSynced = true
-            if let remoteCtx = decoded.context_length, remoteCtx != contextLengthTokens {
+        if let remoteCtx = decoded.context_length {
+            if remoteCtx == contextLengthTokens {
+                remoteContextSynced = true
+            } else if !remoteContextSynced && Date().timeIntervalSince(lastContextSyncAttemptAt) >= 8.0 {
+                lastContextSyncAttemptAt = Date()
                 Task { await syncContextLengthToColab() }
             }
         }
@@ -490,16 +637,24 @@ extension StudioViewModel {
         bf16ShardsCount = decoded.bf16_shards_count ?? 0
         isDownloadingWeights = decoded.is_downloading ?? false
         isLoadingModel = decoded.is_loading_vram ?? false
+        syncMacOSRuntimeActivityAssertion()
+        if cliLoggedIn && !isWakingColab && keepaliveDaemonProcess?.isRunning != true {
+            Task { await ensureKeepaliveDaemonRunning() }
+        }
         if let p = decoded.task_progress { modelTaskProgress = p }
 
         uptimeSeconds = decoded.uptime_seconds ?? uptimeSeconds
         cuBurnRatePerHour = decoded.cu_burn_rate_per_hour ?? cuBurnRatePerHour
         sessionCUUsed = decoded.session_cu_used ?? sessionCUUsed
         idleRemainingSeconds = decoded.idle_remaining_seconds ?? idleRemainingSeconds
-        if !remoteIdleSynced {
-            remoteIdleSynced = true
-            if let remoteIdle = decoded.idle_timeout_minutes, remoteIdle != idleTimeoutMinutes {
-                Task { await updateIdleTimeoutConfig(idleTimeoutMinutes) }
+        if let remoteIdle = decoded.idle_timeout_minutes {
+            if remoteIdle == idleTimeoutMinutes {
+                remoteIdleSynced = true
+            } else if Date().timeIntervalSince(lastIdleSyncAttemptAt) >= 8.0 {
+                remoteIdleSynced = false
+                lastIdleSyncAttemptAt = Date()
+                let targetIdle = idleTimeoutMinutes
+                Task { await updateIdleTimeoutConfig(targetIdle) }
             }
         }
         apiRequestCount = decoded.api_request_count ?? apiRequestCount

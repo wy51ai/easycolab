@@ -16,12 +16,19 @@ import sys
 import json
 import time
 import uuid
+import signal
 import argparse
 import tempfile
+import threading
+import contextlib
+import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from importlib import resources
 
 import requests
+import websocket
+from websocket import ABNF
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -217,13 +224,29 @@ def cmd_auth_logout():
     print(json.dumps({"ok": True, "logged_in": False, "email": ""}))
 
 
+@contextlib.contextmanager
+def _quiet_colab_cli():
+    """将 colab_cli 内部 typer.echo (如 Pruned stale local session) 重定向至 stderr，保持 stdout 纯净 JSON 输出"""
+    with contextlib.redirect_stdout(sys.stderr):
+        yield
+
+
 def _safe_sync_sessions():
     for attempt in range(3):
         try:
-            return state.sync_sessions()
+            with _quiet_colab_cli():
+                return state.sync_sessions()
         except Exception:
             if attempt == 2:
-                cached = {s.name: s for s in state.store.list()}
+                try:
+                    with _quiet_colab_cli():
+                        listed = state.store.list()
+                except Exception:
+                    listed = []
+                if isinstance(listed, dict):
+                    cached = dict(listed)
+                else:
+                    cached = {s.name: s for s in listed if getattr(s, "name", None)}
                 return cached, []
             time.sleep(1.2)
 
@@ -314,26 +337,28 @@ def cmd_stop_all():
         return
 
     try:
-        local_sessions, assignments = state.sync_sessions()
+        with _quiet_colab_cli():
+            local_sessions, assignments = state.sync_sessions()
         stopped_count = 0
         for s in list(local_sessions.values()):
             try:
-                rt = ColabRuntime(s.url, s.token, kernel_id=s.kernel_id)
-                try:
-                    rt.execute_code(
-                        "import urllib.request\n"
-                        "try:\n"
-                        "    urllib.request.urlopen(urllib.request.Request("
-                        "'http://127.0.0.1:27860/minimax_api/comfyui/sync_drive', "
-                        "data=b'{}', headers={'Content-Type':'application/json'}, method='POST'), timeout=18)\n"
-                        "except Exception:\n"
-                        "    pass\n",
-                        allow_stdin=False,
-                        timeout=22,
-                    )
-                except Exception:
-                    pass
-                rt.stop(shutdown_kernel=True)
+                with _quiet_colab_cli():
+                    rt = ColabRuntime(s.url, s.token, kernel_id=s.kernel_id)
+                    try:
+                        rt.execute_code(
+                            "import urllib.request\n"
+                            "try:\n"
+                            "    urllib.request.urlopen(urllib.request.Request("
+                            "'http://127.0.0.1:27860/minimax_api/comfyui/sync_drive', "
+                            "data=b'{}', headers={'Content-Type':'application/json'}, method='POST'), timeout=18)\n"
+                            "except Exception:\n"
+                            "    pass\n",
+                            allow_stdin=False,
+                            timeout=22,
+                        )
+                    except Exception:
+                        pass
+                    rt.stop(shutdown_kernel=True)
             except Exception:
                 pass
             try:
@@ -341,7 +366,8 @@ def cmd_stop_all():
                 stopped_count += 1
             except Exception:
                 pass
-            state.store.remove(s.name)
+            with _quiet_colab_cli():
+                state.store.remove(s.name)
 
         # 同时清理所有未在本地登记的云端孤儿实例 (Orphan VMs)
         for a in assignments:
@@ -466,6 +492,11 @@ def cmd_wake(gpu_type: str, app_py_path: str):
 
     import getpass
     password = os.environ.pop("EASYCOLAB_ADMIN_PASSWORD", "")
+    raw_idle_min = os.environ.get("EASYCOLAB_IDLE_TIMEOUT_MINUTES", "").strip()
+    try:
+        initial_idle_minutes = int(raw_idle_min) if raw_idle_min != "" else None
+    except ValueError:
+        initial_idle_minutes = None
     if not password and sys.stdin.isatty():
         password = getpass.getpass("Management password (24+ URL-safe characters): ")
     if not password:
@@ -648,7 +679,10 @@ if os.path.exists(log_path):
     os.remove(log_path)
 
 with open(log_path, "w") as out_f:
-    subprocess.Popen([sys.executable, "-u", "/content/app.py"], cwd="/content", env={**os.environ, "EASYCOLAB_ADMIN_PASSWORD": admin_password}, stdout=out_f, stderr=subprocess.STDOUT)
+    child_env = {**os.environ, "EASYCOLAB_ADMIN_PASSWORD": admin_password}
+    if INITIAL_IDLE_MINUTES is not None:
+        child_env["EASYCOLAB_IDLE_TIMEOUT_MINUTES"] = str(INITIAL_IDLE_MINUTES)
+    subprocess.Popen([sys.executable, "-u", "/content/app.py"], cwd="/content", env=child_env, stdout=out_f, stderr=subprocess.STDOUT)
 
 url_re = re.compile(r"^EasyColab URL: (https://[a-zA-Z0-9-]+\.gradio\.live)$", re.MULTILINE)
 found_url = None
@@ -696,7 +730,11 @@ else:
                     with open(password_file, "w", encoding="ascii") as stream:
                         stream.write(password)
                     contents.upload(password_file, "content/" + stage)
-                code = "ADMIN_STAGE = " + repr("/content/" + stage) + "\n" + boot_code
+                code = (
+                    "ADMIN_STAGE = " + repr("/content/" + stage) + "\n"
+                    + "INITIAL_IDLE_MINUTES = " + repr(initial_idle_minutes) + "\n"
+                    + boot_code
+                )
                 return rt.execute_code(code, allow_stdin=False, timeout=300)
             finally:
                 try:
@@ -722,117 +760,482 @@ else:
         print(f"WAKE_ERROR: {str(e)}", flush=True)
 
 
+class _ProxyAuthExpiredError(RuntimeError):
+    """Runtime Proxy Token 已过期或失效 (HTTP 401/403)，需立即通过 list_assignments 刷新"""
+
+
+def _session_token_ttl_seconds(s: SessionState) -> float:
+    exp = getattr(s, "token_expires_at", None)
+    if exp is None:
+        return 3600.0
+    try:
+        if isinstance(exp, (int, float)):
+            return float(exp) - time.time()
+        if hasattr(exp, "timestamp"):
+            return float(exp.timestamp()) - time.time()
+        if isinstance(exp, str) and exp.strip():
+            dt = datetime.fromisoformat(exp.strip().replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp() - time.time()
+    except Exception:
+        pass
+    return 3600.0
+
+
+def _sync_and_adopt_sessions():
+    local_sessions, assignments = _safe_sync_sessions()
+    ep_map = {a.endpoint: a for a in assignments}
+
+    if not local_sessions and assignments:
+        a0 = assignments[0]
+        s_auto = SessionState(
+            name="easycolab",
+            token=a0.runtime_proxy_info.token,
+            url=a0.runtime_proxy_info.url,
+            endpoint=a0.endpoint,
+            token_expires_at=a0.runtime_proxy_info.expires_at(),
+            session_id=uuid.uuid4().hex,
+            variant=Variant.GPU.value,
+            accelerator=a0.accelerator.value,
+            machine_shape=Shape.HIGH_RAM.name if a0.machine_shape == Shape.HIGH_RAM else Shape.STANDARD.name,
+        )
+        with _quiet_colab_cli():
+            state.store.add(s_auto)
+        local_sessions = {"easycolab": s_auto}
+
+    for s in list(local_sessions.values()):
+        changed = False
+        if s.endpoint in ep_map:
+            info_proxy = ep_map[s.endpoint].runtime_proxy_info
+            if s.token != info_proxy.token or s.url != info_proxy.url:
+                changed = True
+            s.token = info_proxy.token
+            s.url = info_proxy.url
+            s.token_expires_at = info_proxy.expires_at()
+        if not getattr(s, "session_id", None):
+            s.session_id = uuid.uuid4().hex
+            changed = True
+        if changed:
+            with _quiet_colab_cli():
+                state.store.add(s)
+
+    return local_sessions, assignments
+
+
+def _touch_colab_tunnel_keepalive(endpoint: str) -> bool:
+    if not endpoint:
+        return False
+    try:
+        keepalive_url = f"{state.client.colab_domain.rstrip('/')}/tun/m/{endpoint}/keep-alive/"
+        state.client._issue_request(
+            keepalive_url,
+            method="GET",
+            headers={"X-Colab-Tunnel": "Google"},
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_or_start_remote_kernel(s: SessionState, timeout_s: float = 12.0) -> str:
+    """
+    通过 Colab 官方 Runtime Proxy 查询或启动远端 Jupyter 内核。
+    严禁删除其他已有内核，避免误杀并发调试或子任务内核。
+    """
+    base_url = (s.url or "").rstrip("/")
+    if not base_url or not s.token:
+        raise RuntimeError("Session missing runtime proxy URL or token")
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Colab-Client-Agent": "vscode",
+        "X-Colab-Runtime-Proxy-Token": s.token,
+        "Authorization": f"Bearer {s.token}",
+    }
+    params = {"authuser": "0", "colab-runtime-proxy-token": s.token}
+
+    r = requests.get(f"{base_url}/api/kernels", headers=headers, params=params, timeout=timeout_s)
+    if r.status_code in (401, 403):
+        raise _ProxyAuthExpiredError(f"Runtime proxy HTTP {r.status_code}")
+    if r.status_code != 200:
+        raise RuntimeError(f"GET /api/kernels returned HTTP {r.status_code}")
+
+    kernels = r.json() if r.text else []
+    active_kid = None
+    if isinstance(kernels, list) and kernels:
+        known_ids = [str(k.get("id")) for k in kernels if isinstance(k, dict) and k.get("id")]
+        if known_ids:
+            active_kid = s.kernel_id if (s.kernel_id in known_ids) else known_ids[0]
+
+    if not active_kid:
+        pr = requests.post(
+            f"{base_url}/api/kernels",
+            headers=headers,
+            params=params,
+            json={"name": "python3"},
+            timeout=timeout_s,
+        )
+        if pr.status_code in (401, 403):
+            raise _ProxyAuthExpiredError(f"POST /api/kernels HTTP {pr.status_code}")
+        if pr.status_code not in (200, 201):
+            raise RuntimeError(f"POST /api/kernels returned HTTP {pr.status_code}")
+        pdata = pr.json() if pr.text else {}
+        active_kid = str(pdata.get("id") or "")
+
+    if not active_kid:
+        raise RuntimeError("Unable to obtain remote Jupyter kernel_id")
+
+    changed = False
+    if s.kernel_id != active_kid:
+        s.kernel_id = active_kid
+        changed = True
+    if not s.session_id:
+        s.session_id = uuid.uuid4().hex
+        changed = True
+    if changed:
+        with _quiet_colab_cli():
+            state.store.add(s)
+    return active_kid
+
+
+def _open_colab_proxy_ws(s: SessionState, kernel_id: str, timeout_s: float = 15.0) -> websocket.WebSocket:
+    """
+    建立直连 Google Colab 官方外部 Runtime Proxy (*.prod.r.colab.dev) 的常驻 WebSocket 通道，
+    显式携带 colab-runtime-proxy-token、token、authuser=0 查询参数与认证请求头，
+    确保 Google 外部代理层始终观测到活跃 WebSocket 连接 (connections >= 1)。
+    """
+    base_url = (s.url or "").rstrip("/")
+    if base_url.startswith("https://"):
+        ws_base = "wss://" + base_url[len("https://"):]
+    elif base_url.startswith("http://"):
+        ws_base = "ws://" + base_url[len("http://"):]
+    else:
+        ws_base = "wss://" + base_url
+
+    sid = s.session_id or uuid.uuid4().hex
+    qs = urllib.parse.urlencode({
+        "session_id": sid,
+        "token": s.token,
+        "colab-runtime-proxy-token": s.token,
+        "authuser": "0",
+    })
+    ws_url = f"{ws_base}/api/kernels/{kernel_id}/channels?{qs}"
+    headers = [
+        f"X-Colab-Runtime-Proxy-Token: {s.token}",
+        f"Authorization: Bearer {s.token}",
+        "X-Colab-Client-Agent: vscode",
+        "User-Agent: EasyColab/2.0",
+    ]
+    return websocket.create_connection(
+        ws_url,
+        timeout=timeout_s,
+        origin=base_url,
+        header=headers,
+        enable_multithread=True,
+    )
+
+
+def _drain_proxy_ws_frames(ws: websocket.WebSocket, wait_s: float = 1.0, stop_on_msg_id: str = "") -> bool:
+    """排空服务端下发的 Jupyter 消息与控制帧（自动回复 Ping -> Pong，遇到 Close 立即返回 False）"""
+    deadline = time.time() + max(0.05, wait_s)
+    while True:
+        rem = deadline - time.time()
+        if rem <= 0:
+            return True
+        try:
+            ws.settimeout(min(rem, 1.0))
+            opcode, frame = ws.recv_data(control_frame=True)
+            if opcode == ABNF.OPCODE_CLOSE:
+                return False
+            if stop_on_msg_id and opcode == ABNF.OPCODE_TEXT and frame:
+                raw_txt = frame.decode("utf-8", errors="replace") if isinstance(frame, (bytes, bytearray)) else str(frame)
+                if stop_on_msg_id in raw_txt and '"execute_reply"' in raw_txt:
+                    return True
+        except websocket.WebSocketTimeoutException:
+            return True
+        except Exception:
+            return False
+
+
+def _send_proxy_ws_heartbeat(ws: websocket.WebSocket, session_id: str, touch_client_hb: bool = False) -> bool:
+    """在已打开的外部 Runtime Proxy WebSocket 上发送 Ping 与 Jupyter execute_request，刷新代理与内核活跃度"""
+    msg_id = uuid.uuid4().hex
+    hb_file = "/tmp/.easycolab_client_hb" if touch_client_hb else "/tmp/.easycolab_proxy_hb"
+    code = f"import pathlib; pathlib.Path('{hb_file}').touch(); _easycolab_hb = 1"
+    msg = {
+        "channel": "shell",
+        "header": {
+            "msg_id": msg_id,
+            "username": "easycolab",
+            "session": session_id,
+            "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "msg_type": "execute_request",
+            "version": "5.3",
+        },
+        "parent_header": {},
+        "metadata": {},
+        "content": {
+            "code": code,
+            "silent": False,
+            "store_history": False,
+            "user_expressions": {},
+            "allow_stdin": False,
+            "stop_on_error": False,
+        },
+    }
+    try:
+        ws.settimeout(10.0)
+        ws.ping("easycolab")
+        ws.send(json.dumps(msg))
+        return _drain_proxy_ws_frames(ws, wait_s=2.0, stop_on_msg_id=msg_id)
+    except Exception:
+        return False
+
+
 def cmd_keepalive():
     """
-    向活跃的 Colab Headless 实例发送官方 Runtime Proxy 探活与轻量 Jupyter 内核脉冲：
-    由于 EasyColab 推理流量走 *.gradio.live 隧道，若长时间无 *.prod.r.colab.dev 代理流量且内核 last_activity 静止，
-    Colab 后台闲置回收器可能在连续生成第 2 条视频中途误判实例闲置并强制回收。
-    本命令仅在客户端处于活跃窗口或正在执行生成任务时由 Mac 端定期调用。
+    单次向活跃的 Colab Headless 实例发送官方 Runtime Proxy 探活与轻量 Jupyter 内核脉冲（兼容 CLI / Windows / Linux 调用）。
+    macOS 客户端优先使用长连接常驻子进程 keepalive_daemon。
     """
     if not _has_valid_token():
         print(json.dumps({"ok": True, "logged_in": False}))
         return
 
     try:
-        local_sessions, assignments = _safe_sync_sessions()
-        ep_map = {a.endpoint: a for a in assignments}
+        local_sessions, _ = _sync_and_adopt_sessions()
         touched = 0
-
-        # 若云端有分配但本地无会话记录，自动纳管以便续期
-        if not local_sessions and assignments:
-            a0 = assignments[0]
-            s_auto = SessionState(
-                name="easycolab",
-                token=a0.runtime_proxy_info.token,
-                url=a0.runtime_proxy_info.url,
-                endpoint=a0.endpoint,
-                token_expires_at=a0.runtime_proxy_info.expires_at(),
-                variant=Variant.GPU.value,
-                accelerator=a0.accelerator.value,
-                machine_shape=Shape.HIGH_RAM.name if a0.machine_shape == Shape.HIGH_RAM else Shape.STANDARD.name,
-            )
-            state.store.add(s_auto)
-            local_sessions = {"easycolab": s_auto}
+        warnings = []
 
         for s in list(local_sessions.values()):
-            if s.endpoint in ep_map:
-                info_proxy = ep_map[s.endpoint].runtime_proxy_info
-                s.token = info_proxy.token
-                s.url = info_proxy.url
-                s.token_expires_at = info_proxy.expires_at()
-                state.store.add(s)
-
+            _touch_colab_tunnel_keepalive(s.endpoint)
             if not s.url or not s.token:
                 continue
 
-            base_url = s.url.rstrip("/")
-            headers = {
-                "Accept": "application/json",
-                "X-Colab-Client-Agent": "colab-cli",
-                "X-Colab-Runtime-Proxy-Token": s.token,
-                "Authorization": f"Bearer {s.token}",
-            }
-            params = {"authuser": "0", "colab-runtime-proxy-token": s.token}
+            ws = None
             try:
-                r = requests.get(f"{base_url}/api/kernels", headers=headers, params=params, timeout=10)
-                if r.status_code == 200:
-                    kernels = r.json() if r.text else []
-                    active_kid = None
-                    if isinstance(kernels, list) and kernels:
-                        known_ids = [k.get("id") for k in kernels if k.get("id")]
-                        active_kid = s.kernel_id if (s.kernel_id in known_ids) else known_ids[0]
-                        # 清理多余的历史空转内核，仅保留主内核
-                        for extra_id in known_ids:
-                            if extra_id != active_kid:
-                                try:
-                                    requests.delete(
-                                        f"{base_url}/api/kernels/{extra_id}",
-                                        headers=headers,
-                                        params=params,
-                                        timeout=5,
-                                    )
-                                except Exception:
-                                    pass
-
-                    def _save_kid(kid, _s=s):
-                        _s.kernel_id = kid
-                        state.store.add(_s)
-
-                    def _save_sid(sid, _s=s):
-                        _s.session_id = sid
-                        state.store.add(_s)
-
-                    rt = ColabRuntime(
-                        s.url,
-                        s.token,
-                        session_name=s.name,
-                        kernel_id=active_kid,
-                        session_id=s.session_id,
-                        on_kernel_started=_save_kid,
-                        on_session_started=_save_sid,
-                    )
+                active_kid = _resolve_or_start_remote_kernel(s, timeout_s=12.0)
+                ws = _open_colab_proxy_ws(s, active_kid, timeout_s=15.0)
+                if _send_proxy_ws_heartbeat(ws, s.session_id or uuid.uuid4().hex, touch_client_hb=True):
+                    touched += 1
+                else:
+                    warnings.append(f"{s.name}: heartbeat closed")
+            except Exception as touch_err:
+                warnings.append(f"{s.name}: {touch_err}")
+            finally:
+                if ws is not None:
                     try:
-                        rt.execute_code("_easycolab_hb = 1", allow_stdin=False, timeout=12)
-                        touched += 1
-                    finally:
-                        try:
-                            rt.stop(shutdown_kernel=False)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+                        ws.close(timeout=1)
+                    except Exception:
+                        pass
 
         info = state.client.get_consumption_user_info()
-        print(json.dumps({
+        payload = {
             "ok": True,
             "logged_in": True,
             "touched_kernels": touched,
             "paid_balance": round(float(info.paid_compute_units_balance), 2),
             "burn_rate_hourly": round(float(info.consumption_rate_hourly), 2),
             "active_assignments": int(info.assignments_count),
-        }))
+        }
+        if warnings:
+            payload["warning"] = "; ".join(warnings)
+        print(json.dumps(payload))
     except Exception as e:
         print(json.dumps({"ok": False, "logged_in": True, "error": str(e)}))
+
+
+def cmd_keepalive_daemon():
+    """
+    macOS 原生客户端专属常驻保活守护进程：
+    - 始终保持一条直连 Google Colab 官方外部 Runtime Proxy (wss://*.prod.r.colab.dev/api/kernels/<id>/channels)
+      的真实 WebSocket 长连接，使代理层与 Jupyter 内核的 connections 持续 >= 1（杜绝无浏览器模式下 ~20 分钟孤儿实例强杀）；
+    - 每 25 秒在长连接上发送一次 WebSocket Ping + Jupyter execute_request 脉冲；
+    - 每 45 秒调用 /tun/m/<endpoint>/keep-alive/ 并拉取实时 CU 余额/速率，通过 KEEPALIVE_JSON: 行流式推送给客户端；
+    - 在代理 Token 临近过期 (<10 分钟) 或连接断开时自动刷新 runtimeProxyInfo 并无缝重连；
+    - 监听父进程 stdin 管道 EOF 与进程生命周期：一旦 EasyColab.app 断开实例或退出，立即关闭 WebSocket 并零残留退出。
+    """
+    stop_event = threading.Event()
+    initial_ppid = os.getppid()
+
+    def _handle_sig(_signum, _frame):
+        stop_event.set()
+
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig_obj = getattr(signal, sig_name, None)
+        if sig_obj is not None:
+            try:
+                signal.signal(sig_obj, _handle_sig)
+            except Exception:
+                pass
+
+    if not sys.stdin.isatty():
+        def _watch_stdin_eof():
+            try:
+                while not stop_event.is_set():
+                    data = sys.stdin.read(1)
+                    if data == "":
+                        stop_event.set()
+                        break
+            except Exception:
+                stop_event.set()
+
+        threading.Thread(target=_watch_stdin_eof, daemon=True).start()
+
+    def _emit(obj: dict):
+        try:
+            print("KEEPALIVE_JSON:" + json.dumps(obj, ensure_ascii=False), flush=True)
+        except Exception:
+            stop_event.set()
+
+    if not _has_valid_token():
+        _emit({"ok": True, "logged_in": False, "ws_connected": False})
+        return
+
+    ws_map: dict[str, tuple[websocket.WebSocket, str, str]] = {}  # endpoint -> (ws, url, token)
+
+    def _close_ws(ep: str):
+        entry = ws_map.pop(ep, None)
+        if entry is not None:
+            try:
+                entry[0].close(timeout=1)
+            except Exception:
+                pass
+
+    def _close_all_ws():
+        for ep in list(ws_map.keys()):
+            _close_ws(ep)
+
+    last_sync_ts = 0.0
+    last_hb_ts = 0.0
+    last_usage_ts = 0.0
+    force_resync = True
+    local_sessions: dict[str, SessionState] = {}
+
+    try:
+        while not stop_event.is_set():
+            if os.name != "nt" and os.getppid() != initial_ppid:
+                stop_event.set()
+                break
+
+            now = time.time()
+            min_ttl = min((_session_token_ttl_seconds(s) for s in local_sessions.values()), default=3600.0)
+            if force_resync or (now - last_sync_ts) >= 480.0 or min_ttl < 600.0:
+                try:
+                    local_sessions, _ = _sync_and_adopt_sessions()
+                    last_sync_ts = time.time()
+                    force_resync = False
+                    active_eps = {s.endpoint for s in local_sessions.values() if s.endpoint}
+                    for stale_ep in list(ws_map.keys()):
+                        if stale_ep not in active_eps:
+                            _close_ws(stale_ep)
+                except Exception as sync_err:
+                    _emit({"ok": False, "logged_in": True, "ws_connected": bool(ws_map), "warning": f"sync: {sync_err}"})
+
+            if not local_sessions:
+                if (now - last_usage_ts) >= 30.0:
+                    try:
+                        info = state.client.get_consumption_user_info()
+                        last_usage_ts = time.time()
+                        _emit({
+                            "ok": True,
+                            "logged_in": True,
+                            "ws_connected": False,
+                            "paid_balance": round(float(info.paid_compute_units_balance), 2),
+                            "burn_rate_hourly": round(float(info.consumption_rate_hourly), 2),
+                            "active_assignments": int(info.assignments_count),
+                        })
+                    except Exception:
+                        pass
+                stop_event.wait(6.0)
+                force_resync = True
+                continue
+
+            # 确保每个活跃会话都持有常驻外部 Runtime Proxy WebSocket
+            need_hb = (time.time() - last_hb_ts) >= 25.0
+            any_ws_ok = False
+            last_warn = ""
+
+            for s in list(local_sessions.values()):
+                if stop_event.is_set():
+                    break
+                ep = s.endpoint or s.name
+                existing = ws_map.get(ep)
+                if existing is not None:
+                    old_ws, old_url, old_tok = existing
+                    if not getattr(old_ws, "connected", False) or old_url != s.url or old_tok != s.token:
+                        _close_ws(ep)
+                        existing = None
+
+                if existing is None:
+                    try:
+                        kid = _resolve_or_start_remote_kernel(s, timeout_s=12.0)
+                        new_ws = _open_colab_proxy_ws(s, kid, timeout_s=15.0)
+                        if _send_proxy_ws_heartbeat(new_ws, s.session_id or uuid.uuid4().hex, touch_client_hb=False):
+                            ws_map[ep] = (new_ws, s.url, s.token)
+                            any_ws_ok = True
+                            last_hb_ts = time.time()
+                        else:
+                            try:
+                                new_ws.close(timeout=1)
+                            except Exception:
+                                pass
+                            force_resync = True
+                    except _ProxyAuthExpiredError as auth_err:
+                        last_warn = str(auth_err)
+                        force_resync = True
+                    except Exception as conn_err:
+                        last_warn = str(conn_err)
+                        force_resync = True
+                else:
+                    cur_ws = existing[0]
+                    if need_hb:
+                        if _send_proxy_ws_heartbeat(cur_ws, s.session_id or uuid.uuid4().hex, touch_client_hb=False):
+                            any_ws_ok = True
+                        else:
+                            _close_ws(ep)
+                            force_resync = True
+                            last_warn = "ws heartbeat lost, reconnecting"
+                    else:
+                        if _drain_proxy_ws_frames(cur_ws, wait_s=1.0):
+                            any_ws_ok = True
+                        else:
+                            _close_ws(ep)
+                            force_resync = True
+                            last_warn = "ws closed by peer, reconnecting"
+
+            if need_hb and any_ws_ok:
+                last_hb_ts = time.time()
+
+            now2 = time.time()
+            if (now2 - last_usage_ts) >= 45.0 or (last_usage_ts == 0.0):
+                for s in list(local_sessions.values()):
+                    _touch_colab_tunnel_keepalive(s.endpoint)
+                try:
+                    info = state.client.get_consumption_user_info()
+                    last_usage_ts = now2
+                    payload = {
+                        "ok": True,
+                        "logged_in": True,
+                        "ws_connected": any_ws_ok,
+                        "paid_balance": round(float(info.paid_compute_units_balance), 2),
+                        "burn_rate_hourly": round(float(info.consumption_rate_hourly), 2),
+                        "active_assignments": int(info.assignments_count),
+                    }
+                    if last_warn:
+                        payload["warning"] = last_warn
+                    _emit(payload)
+                except Exception as usage_err:
+                    last_usage_ts = now2
+                    _emit({"ok": False, "logged_in": True, "ws_connected": any_ws_ok, "warning": str(usage_err)})
+
+            if not any_ws_ok and not stop_event.is_set():
+                stop_event.wait(3.0)
+            elif need_hb and not stop_event.is_set():
+                stop_event.wait(1.0)
+    finally:
+        _close_all_ws()
 
 
 def main(argv=None):
@@ -855,6 +1258,7 @@ def main(argv=None):
     )
 
     sub.add_parser("keepalive")
+    sub.add_parser("keepalive_daemon")
     sub.add_parser("stop_all")
 
     args = parser.parse_args(argv)
@@ -870,6 +1274,8 @@ def main(argv=None):
         cmd_wake(args.gpu, args.app_py)
     elif args.cmd == "keepalive":
         cmd_keepalive()
+    elif args.cmd == "keepalive_daemon":
+        cmd_keepalive_daemon()
     elif args.cmd == "stop_all":
         cmd_stop_all()
 

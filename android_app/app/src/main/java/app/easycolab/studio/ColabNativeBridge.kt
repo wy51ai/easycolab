@@ -547,10 +547,12 @@ class ColabNativeBridge private constructor(context: Context) {
                     rec,
                     """
                     import urllib.request
-                    try:
-                        urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:7860/minimax_api/comfyui/sync_drive', data=b'{}', headers={'Content-Type':'application/json'}, method='POST'), timeout=12)
-                    except Exception:
-                        pass
+                    for _p in (27860, 7860):
+                        try:
+                            urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{_p}/minimax_api/comfyui/sync_drive', data=b'{}', headers={'Content-Type':'application/json'}, method='POST'), timeout=12)
+                            break
+                        except Exception:
+                            pass
                     """.trimIndent(),
                     timeoutMs = 15_000L
                 )
@@ -1139,11 +1141,23 @@ else:
                 val tok = proxy?.optString("token", "").orEmpty()
                 val url = proxy?.optString("url", "").orEmpty()
                 if (ep.isNotEmpty() && tok.isNotEmpty() && url.isNotEmpty()) {
+                    try {
+                        colabTunnelRequest(
+                            "/tun/m/$ep/keep-alive/",
+                            method = "GET",
+                            extraHeaders = mapOf("X-Colab-Tunnel" to "Google")
+                        )
+                    } catch (_: Exception) {
+                    }
                     val prev = loadSessionRecord()
                     val updated = RuntimeSessionRecord("easycolab", tok, url, ep, acc, prev?.kernelId, prev?.sessionId)
                     saveSessionRecord(updated)
                     try {
-                        executeCodeOnKernel(updated, "_easycolab_hb = 1", timeoutMs = 12_000L)
+                        executeCodeOnKernel(
+                            updated,
+                            "import pathlib; pathlib.Path('/tmp/.easycolab_client_hb').touch(); _easycolab_hb = 1",
+                            timeoutMs = 12_000L
+                        )
                     } catch (_: Exception) {
                     }
                 }

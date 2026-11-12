@@ -832,11 +832,13 @@ struct ColabJobResponse: Codable {
 struct BridgeAuthStatusResponse: Codable {
     var ok: Bool?
     var logged_in: Bool?
+    var ws_connected: Bool?
     var email: String?
     var paid_balance: Double?
     var burn_rate_hourly: Double?
     var active_assignments: Int?
     var message: String?
+    var warning: String?
     var error: String?
 }
 

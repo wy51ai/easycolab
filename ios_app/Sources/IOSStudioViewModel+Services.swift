@@ -591,9 +591,9 @@ extension IOSStudioViewModel {
                     await checkColabStatus(silent: true)
                 }
 
-                if tick % 26 == 0 && cliLoggedIn && !isWakingColab {
+                if tick % 16 == 0 && cliLoggedIn && !isWakingColab {
                     let shouldKeepalive = isConnected && (
-                        isGenerating || isDownloadingWeights || isLoadingModel || comfyStarting || comfyQueueRunning > 0 || idleTimeoutMinutes <= 0 || idleRemainingSeconds > 75
+                        isGenerating || isDownloadingWeights || isLoadingModel || comfyRunning || comfyStarting || comfyQueueRunning > 0 || idleTimeoutMinutes <= 0 || idleRemainingSeconds > 75
                     )
                     if shouldKeepalive {
                         let st = await ColabNativeBridge.shared.keepalive()

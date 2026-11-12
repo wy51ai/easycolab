@@ -586,10 +586,12 @@ actor ColabNativeBridge {
                 session: rec,
                 code: """
                 import urllib.request
-                try:
-                    urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:7860/minimax_api/comfyui/sync_drive', data=b'{}', headers={'Content-Type':'application/json'}, method='POST'), timeout=12)
-                except Exception:
-                    pass
+                for _p in (27860, 7860):
+                    try:
+                        urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{_p}/minimax_api/comfyui/sync_drive', data=b'{}', headers={'Content-Type':'application/json'}, method='POST'), timeout=12)
+                        break
+                    except Exception:
+                        pass
                 """,
                 timeout: 15
             )
@@ -1194,6 +1196,14 @@ else:
            let proxy = first["runtimeProxyInfo"] as? [String: Any],
            let tok = proxy["token"] as? String,
            let url = proxy["url"] as? String {
+            if !ep.isEmpty {
+                _ = try? await colabTunnelRequest(
+                    path: "/tun/m/\(ep)/keep-alive/",
+                    method: "GET",
+                    extraHeaders: ["X-Colab-Tunnel": "Google"],
+                    timeout: 12
+                )
+            }
             let prev = loadSessionRecord()
             let updated = RuntimeSessionRecord(
                 name: "easycolab",
@@ -1205,7 +1215,11 @@ else:
                 sessionId: prev?.sessionId
             )
             saveSessionRecord(updated)
-            _ = try? await executeCodeOnKernel(session: updated, code: "_easycolab_hb = 1", timeout: 12)
+            _ = try? await executeCodeOnKernel(
+                session: updated,
+                code: "import pathlib; pathlib.Path('/tmp/.easycolab_client_hb').touch(); _easycolab_hb = 1",
+                timeout: 12
+            )
         }
         return await fetchAuthStatus()
     }

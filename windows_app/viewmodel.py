@@ -654,11 +654,12 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
             self.check_colab_status(silent=True)
 
         # Smart Keepalive & Official CU Ledger Sync
-        if tick % 32 == 0 and self.cli_logged_in and not self.is_waking_colab:
+        if tick % 20 == 0 and self.cli_logged_in and not self.is_waking_colab:
             should_keepalive = self.is_connected and (
                 self.is_generating
                 or self.is_downloading_weights
                 or self.is_loading_model
+                or self.comfy_running
                 or self.comfy_starting
                 or self.comfy_downloading_weight
                 or self.comfy_queue_running > 0
