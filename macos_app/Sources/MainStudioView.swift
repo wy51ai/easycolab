@@ -1464,7 +1464,7 @@ struct MainStudioView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Picker(L("画幅", "Resolution"), selection: $vm.selectedImageResolution) {
-                    ForEach(IMAGE_RESOLUTIONS) { opt in
+                    ForEach(vm.activeImageResolutions) { opt in
                         Text(opt.label).tag(opt)
                     }
                 }
@@ -1472,23 +1472,37 @@ struct MainStudioView: View {
                 .frame(maxWidth: .infinity)
             }
 
-            VStack(alignment: .leading, spacing: 3) {
+            if vm.isMiniMaxH3ImageModel {
                 HStack {
                     Text(L("采样步数", "Sampling Steps"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Text(L("\(Int(vm.inferenceSteps)) 步", "\(Int(vm.inferenceSteps)) steps"))
+                    Text(L("6 步 (PDD 蒸馏固定)", "6 steps (PDD Distilled)"))
                         .font(.caption.weight(.medium))
+                        .foregroundStyle(.primary)
                         .monospacedDigit()
                 }
-                Slider(
-                    value: Binding(
-                        get: { vm.inferenceSteps },
-                        set: { vm.inferenceSteps = $0.rounded().clamped(to: 4...50) }
-                    ),
-                    in: 4...50
-                )
+                .padding(.vertical, 2)
+            } else {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text(L("采样步数", "Sampling Steps"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(L("\(Int(vm.inferenceSteps)) 步", "\(Int(vm.inferenceSteps)) steps"))
+                            .font(.caption.weight(.medium))
+                            .monospacedDigit()
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { vm.inferenceSteps },
+                            set: { vm.inferenceSteps = $0.rounded().clamped(to: 4...50) }
+                        ),
+                        in: 4...50
+                    )
+                }
             }
 
             if vm.selectedModelId == "z_image_turbo" && vm.taskModeId == "i2i_edit" {

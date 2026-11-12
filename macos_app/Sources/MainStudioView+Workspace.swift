@@ -1146,12 +1146,14 @@ extension MainStudioView {
             }
         case "i2i_edit":
             WorkspaceCard(
-                title: vm.selectedModelId == "qwen_image_21"
+                title: (vm.selectedModelId == "qwen_image_21" || vm.isMiniMaxH3ImageModel)
                     ? L("指令修图参考原图", "Instruction Image-Editing References")
                     : L("图生图重绘参考底图", "Image-to-Image Reference"),
-                subtitle: vm.selectedModelId == "qwen_image_21"
-                    ? L("支持上传 1~2 张参考图进行局部编辑、换背景或多主体融合", "Upload 1–2 reference images for local edits, background swaps, or multi-subject fusion")
-                    : L("上传参考原图并在左侧调节重绘幅度", "Upload a reference image and tune Denoising Strength in the left sidebar"),
+                subtitle: vm.isMiniMaxH3ImageModel
+                    ? L("支持上传 1~2 张参考图（可在提示词中用 <Picture 1> / <Picture 2> 指代）进行精准修图或融合", "Upload 1–2 reference images (refer via <Picture 1> / <Picture 2> in prompt) for editing or fusion")
+                    : (vm.selectedModelId == "qwen_image_21"
+                        ? L("支持上传 1~2 张参考图进行局部编辑、换背景或多主体融合", "Upload 1–2 reference images for local edits, background swaps, or multi-subject fusion")
+                        : L("上传参考原图并在左侧调节重绘幅度", "Upload a reference image and tune Denoising Strength in the left sidebar")),
                 icon: "wand.and.rays"
             ) {
                 HStack(spacing: 12) {
@@ -1160,7 +1162,7 @@ extension MainStudioView {
                         subtitle: L("拖入待编辑原图", "Drop source image to edit"),
                         image: $vm.firstFrameImage
                     )
-                    if vm.selectedModelId == "qwen_image_21" {
+                    if vm.selectedModelId == "qwen_image_21" || vm.isMiniMaxH3ImageModel {
                         FrameDropWell(
                             title: L("融合参考图 2 (可选)", "Fusion Reference 2 (Optional)"),
                             subtitle: L("用于多图主体融合编辑", "For multi-image subject fusion"),
@@ -1270,7 +1272,7 @@ extension MainStudioView {
                 }
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
-            } else if mod == .image || mod == .video {
+            } else if (mod == .image && !vm.isMiniMaxH3ImageModel) || mod == .video {
                 promptEditor(
                     title: L("反向提示词 Negative Prompt（可选，排除低质或多余元素）", "Negative Prompt (Optional — exclude low quality or unwanted elements)"),
                     placeholder: L("如：模糊、低分辨率、畸变、水印、杂乱文字...", "e.g. blurry, low resolution, deformed, watermark, garbled text..."),

@@ -677,6 +677,14 @@ class StudioViewModel: ObservableObject {
         loadedModelIds.contains(selectedModelId) || (modelLoaded && loadedModelId == selectedModelId)
     }
 
+    var isMiniMaxH3ImageModel: Bool {
+        selectedModelId == "minimax_h3_image" || activeModelSpec.repoId.lowercased() == "minimaxai/minimax-h3-image"
+    }
+
+    var activeImageResolutions: [ResolutionOption] {
+        isMiniMaxH3ImageModel ? MINIMAX_H3_IMAGE_RESOLUTIONS : IMAGE_RESOLUTIONS
+    }
+
     var isQwenLoadedInVRAM: Bool {
         loadedModelIds.contains("qwen38_27b")
             || loadedModelIds.contains("qwen38_27b_gguf")
@@ -746,6 +754,14 @@ class StudioViewModel: ObservableObject {
         allDownloaded = false
         totalDiskSizeGB = 0.0
         modelLoaded = loadedModelIds.contains(spec.id) || (loadedModelId == spec.id)
+        if spec.modality == .image {
+            let targetResList = (spec.id == "minimax_h3_image" || spec.repoId.lowercased() == "minimaxai/minimax-h3-image")
+                ? MINIMAX_H3_IMAGE_RESOLUTIONS
+                : IMAGE_RESOLUTIONS
+            if !targetResList.contains(selectedImageResolution), let firstRes = targetResList.first {
+                selectedImageResolution = firstRes
+            }
+        }
 
         // 自动填入匹配该模态的首条示例提示词（若当前框还是另一模态的默认模板）
         if let sample = PRESET_TEMPLATES.first(where: {

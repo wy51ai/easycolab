@@ -1349,6 +1349,32 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 134.1,
         "files": MINIMAX_H3_BF16_FILES,
     },
+    "minimax_h3_image": {
+        "id": "minimax_h3_image",
+        "name": "MiniMax-H3-Image (33B · 4K)",
+        "repo_id": "MiniMaxAI/MiniMax-H3-Image",
+        "modality": "image",
+        "pipeline_arch": "minimax_h3_image",
+        "category": "6 步原生 4K (16MP) 文生图与多参考图指令修图 · 共享编码器零拷贝复用",
+        "approx_size_gb": 135.3,
+        "files": [
+            (
+                f"transformer_diffusers/diffusion_pytorch_model-{i:05d}-of-00012.safetensors",
+                f"MiniMax-H3-Image 33B 图像 DiT 主干 {i}/12",
+            )
+            for i in range(1, 13)
+        ]
+        + [
+            (
+                f"text_encoder/model-{i:05d}-of-00014.safetensors",
+                f"32B 视觉多模态编码器 {i}/14 (可与 MiniMax-H3 自动共享)",
+            )
+            for i in range(1, 15)
+        ]
+        + [
+            ("vae_diffusers/diffusion_pytorch_model.safetensors", "4K 16MP 高保真图像 VAE 解码器"),
+        ],
+    },
     "qwen38_27b": {
         "id": "qwen38_27b",
         "name": "Qwen3.8-27B",
@@ -1411,8 +1437,18 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
     },
 }
 
+MINIMAX_H3_IMAGE_FILES = list(MODEL_CATALOG["minimax_h3_image"]["files"])
 BUILTIN_MODEL_IDS = set(MODEL_CATALOG.keys())
 CUSTOM_MODELS_LOCK = threading.Lock()
+
+
+def _normalize_builtin_model_alias(model_id: Optional[str], repo_id: str = "") -> Optional[str]:
+    """兼容曾通过自定义仓库手动导入的内置旗舰模型 ID（如 custom_minimaxai_minimax_h3_image -> minimax_h3_image）"""
+    mid = (model_id or "").strip()
+    rlow = (repo_id or "").strip().lower()
+    if mid in ("custom_minimaxai_minimax_h3_image", "minimax-h3-image") or rlow == "minimaxai/minimax-h3-image":
+        return "minimax_h3_image"
+    return mid or None
 
 
 def _get_custom_models_json_paths() -> List[str]:
@@ -1469,7 +1505,8 @@ def _load_persisted_custom_models():
                 if not isinstance(item, dict) or not item.get("id") or not item.get("repo_id"):
                     continue
                 mid = str(item["id"])
-                if mid in BUILTIN_MODEL_IDS:
+                item_repo_low = str(item.get("repo_id") or "").strip().lower()
+                if mid in BUILTIN_MODEL_IDS or item_repo_low == "minimaxai/minimax-h3-image":
                     continue
                 raw_files = item.get("files") or []
                 norm_files: List[Tuple[str, str]] = []
@@ -2032,7 +2069,18 @@ def inspect_and_resolve_hf_repo(
     repo_low = repo_clean.lower()
     # 兼容已知特定多模态/图像生成仓库结构（如用户在客户端手动导入）
     if not pat_clean:
-        if repo_low == "minimaxai/minimax-h3" or "minimax-h3" in repo_low and "gguf" not in repo_low:
+        if repo_low == "minimaxai/minimax-h3-image" or ("minimax-h3-image" in repo_low and "gguf" not in repo_low):
+            m_img_spec = MODEL_CATALOG["minimax_h3_image"]
+            return {
+                "repo_id": repo_clean,
+                "include_pattern": "",
+                "modality": "image",
+                "pipeline_arch": "minimax_h3_image",
+                "category": "原生内置专享 · 6 步 4K (16MP) 文生图与多参考图指令修图",
+                "approx_size_gb": m_img_spec["approx_size_gb"],
+                "files": list(MINIMAX_H3_IMAGE_FILES),
+            }
+        if repo_low == "minimaxai/minimax-h3" or ("minimax-h3" in repo_low and "image" not in repo_low and "gguf" not in repo_low):
             return {
                 "repo_id": repo_clean,
                 "include_pattern": "",
@@ -2270,7 +2318,9 @@ def inspect_and_resolve_hf_repo(
     elif modality == "video_audio":
         pipeline_arch = "minimax_h3"
     elif modality == "image":
-        if "z-image" in repo_low:
+        if "minimax-h3-image" in repo_low:
+            pipeline_arch = "minimax_h3_image"
+        elif "z-image" in repo_low:
             pipeline_arch = "z_image_turbo"
         elif "qwen-image" in repo_low:
             pipeline_arch = "qwen_image_21"
@@ -2331,6 +2381,25 @@ def register_custom_hf_model_core(
         )
         repo_clean = resolved["repo_id"]
         pat_clean = resolved["include_pattern"]
+        if repo_clean.lower() == "minimaxai/minimax-h3-image" and not pat_clean:
+            with CUSTOM_MODELS_LOCK:
+                stale_ids = [
+                    cid for cid, cspec in MODEL_CATALOG.items()
+                    if cspec.get("is_custom") and str(cspec.get("repo_id") or "").lower() == "minimaxai/minimax-h3-image"
+                ]
+                for cid in stale_ids:
+                    MODEL_CATALOG.pop(cid, None)
+                if stale_ids:
+                    _save_persisted_custom_models()
+            SELECTED_MODEL_ID = "minimax_h3_image"
+            builtin_spec = MODEL_CATALOG["minimax_h3_image"]
+            msg = (
+                "已自动切换至内置专属引擎「MiniMax-H3-Image (33B · 4K)」"
+                "（仅下载 Diffusers 必需 27 个分片，并自动零拷贝共享 MiniMax-H3 的 66.7GB 编码器权重）！"
+            )
+            MODEL_DOWNLOAD_STATE["message"] = msg
+            print(f"[MiniMax-H3-Image] {msg}")
+            return True, msg, builtin_spec
         mid = (model_id_override or "").strip() or _make_custom_model_id(repo_clean, pat_clean)
         if mid in BUILTIN_MODEL_IDS:
             mid = f"custom_{mid}"
@@ -2929,7 +2998,10 @@ def _safe_shm_available_bytes(reserve_ram_gb: float = 34.0) -> int:
     if total_ram_gb > 0:
         eff_reserve = reserve_ram_gb
         try:
-            if any("内存热备" in str(rt.get("mode_label", "")) for rt in LOADED_RUNTIMES.values()):
+            if any(
+                ("内存热备" in str(rt.get("mode_label", "")) or "ComponentsManager" in str(rt.get("mode_label", "")))
+                for rt in LOADED_RUNTIMES.values()
+            ):
                 eff_reserve = max(eff_reserve, 40.0)
         except Exception:
             pass
@@ -2942,8 +3014,10 @@ def _get_model_dirs(model_id: str) -> Tuple[Optional[str], str, str]:
     """返回指定模型的 (RAM内存盘目录或None, 本地高速NVMe目录, Google Drive/持久盘目录)"""
     spec = MODEL_CATALOG.get(model_id, MODEL_CATALOG["minimax_h3"])
     repo_sub = spec["repo_id"]
+    pipeline_arch = spec.get("pipeline_arch") or model_id
     ram_dir = None
-    if os.path.exists("/dev/shm"):
+    # MiniMax-H3 / MiniMax-H3-Image (~135GB) 推理期依赖 CPU DDR5 内存热备或 ComponentsManager 轮换，禁止拷入 /dev/shm 以免与匿名内存争抢 Cgroup 上限
+    if os.path.exists("/dev/shm") and pipeline_arch not in ("minimax_h3_image", "minimax_h3"):
         try:
             shm_free_gb = _safe_shm_available_bytes(reserve_ram_gb=34.0) / (1024 ** 3)
             # 仅当 /dev/shm 配额与容器真实可用物理内存均足以容纳模型时才把新模型放入内存盘
@@ -2962,11 +3036,12 @@ def _get_model_dirs(model_id: str) -> Tuple[Optional[str], str, str]:
     return ram_dir, nvme_dir, drive_dir
 
 
-def _find_existing_model_file(model_id: str, fname: str) -> Optional[str]:
-    """按速度优先级查找已存在的模型权重文件：1. /dev/shm 内存盘 -> 2. 本地 NVMe -> 3. Google Drive (含历史目录与 HuggingFace 缓存兼容)"""
+def _find_existing_model_file(model_id: str, fname: str, _allow_peer_share: bool = True) -> Optional[str]:
+    """按速度优先级查找已存在的模型权重文件：1. /dev/shm 内存盘 -> 2. 本地 NVMe -> 3. Google Drive (含历史目录与跨模型共享编码器兼容)"""
     ram_dir, nvme_dir, drive_dir = _get_model_dirs(model_id)
     spec = MODEL_CATALOG.get(model_id, MODEL_CATALOG["minimax_h3"])
     repo_sub = spec["repo_id"]
+    pipeline_arch = spec.get("pipeline_arch") or model_id
     candidates = []
     if ram_dir:
         candidates.append(os.path.join(ram_dir, fname))
@@ -2982,12 +3057,26 @@ def _find_existing_model_file(model_id: str, fname: str) -> Optional[str]:
     for p in candidates:
         if os.path.exists(p) and os.path.getsize(p) > 64 * 1024:
             return p
+
+    # MiniMax-H3 与 MiniMax-H3-Image 的 14 个 32B VLM text_encoder 分片 (66.7 GB) 二进制 100% 一致，支持双向零拷贝共享免重复下载！
+    if _allow_peer_share:
+        if pipeline_arch == "minimax_h3_image" and fname.startswith("text_encoder/model-") and fname.endswith("-of-00014.safetensors"):
+            peer_fname = f"FL2VA/{fname}"
+            peer_hit = _find_existing_model_file("minimax_h3", peer_fname, _allow_peer_share=False)
+            if peer_hit:
+                return peer_hit
+        elif pipeline_arch == "minimax_h3" and fname.startswith("FL2VA/text_encoder/model-") and fname.endswith("-of-00014.safetensors"):
+            peer_fname = fname[len("FL2VA/"):]
+            peer_hit = _find_existing_model_file("minimax_h3_image", peer_fname, _allow_peer_share=False)
+            if peer_hit:
+                return peer_hit
     return None
 
 
 def check_model_files_status(model_id: Optional[str] = None) -> Dict[str, Any]:
     """检查指定开源模型在内存盘/磁盘/云盘上的权重文件完整性与大小"""
-    target_id = model_id if (model_id and model_id in MODEL_CATALOG) else SELECTED_MODEL_ID
+    norm_id = _normalize_builtin_model_alias(model_id)
+    target_id = norm_id if (norm_id and norm_id in MODEL_CATALOG) else SELECTED_MODEL_ID
     spec = MODEL_CATALOG[target_id]
     req_files = spec["files"]
     ram_dir, nvme_dir, drive_dir = _get_model_dirs(target_id)
@@ -3172,8 +3261,9 @@ def get_live_telemetry_snapshot() -> Dict[str, Any]:
 def get_gpu_status_dict(model_id: Optional[str] = None) -> Dict[str, Any]:
     """返回结构化的 GPU 状态、实例磁盘空间、多模型注册信息、CU 算力消耗账本、闲置倒计时与实时终端进度流"""
     global SELECTED_MODEL_ID
-    if model_id and model_id in MODEL_CATALOG:
-        SELECTED_MODEL_ID = model_id
+    norm_id = _normalize_builtin_model_alias(model_id)
+    if norm_id and norm_id in MODEL_CATALOG:
+        SELECTED_MODEL_ID = norm_id
     target_id = SELECTED_MODEL_ID
 
     file_status = _get_cached_model_files_status(target_id)
@@ -3353,7 +3443,8 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
     if MODEL_DOWNLOAD_STATE["is_downloading"]:
         return False, "模型正在下载中，请稍候..."
 
-    target_id = model_id if (model_id and model_id in MODEL_CATALOG) else SELECTED_MODEL_ID
+    norm_id = _normalize_builtin_model_alias(model_id)
+    target_id = norm_id if (norm_id and norm_id in MODEL_CATALOG) else SELECTED_MODEL_ID
     SELECTED_MODEL_ID = target_id
     spec = MODEL_CATALOG[target_id]
     repo_id = spec["repo_id"]
@@ -3372,15 +3463,22 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
             login(token=hf_token.strip(), add_to_git_credential=False)
 
         ram_dir, nvme_dir, drive_dir = _get_model_dirs(target_id)
+        already_ready_gb = 0.0
+        for fn_chk, _ in req_files:
+            ex_p = _find_existing_model_file(target_id, fn_chk)
+            if ex_p and os.path.exists(ex_p):
+                already_ready_gb += os.path.getsize(ex_p) / (1024 ** 3)
+        missing_approx_gb = max(0.5, float(spec["approx_size_gb"]) - already_ready_gb)
+
         drive_has_space = False
         if DRIVE_MOUNTED and os.path.exists("/content/drive/MyDrive"):
             try:
                 drive_free_gb = shutil.disk_usage("/content/drive/MyDrive").free / (1024 ** 3)
-                drive_has_space = drive_free_gb >= spec["approx_size_gb"] + 2.0
+                drive_has_space = drive_free_gb >= missing_approx_gb + 2.0
                 if not drive_has_space:
                     print(
-                        f"ℹ️ Google Drive 剩余空间 ({drive_free_gb:.1f} GB) 小于 {spec['name']} 所需容量 "
-                        f"({spec['approx_size_gb']:.1f} GB)，自动改用实例本地高速 NVMe 磁盘 ({nvme_dir}) 存储！"
+                        f"ℹ️ Google Drive 剩余空间 ({drive_free_gb:.1f} GB) 小于 {spec['name']} 待下载增量 "
+                        f"({missing_approx_gb:.1f} GB)，自动改用实例本地高速 NVMe 磁盘 ({nvme_dir}) 存储！"
                     )
             except Exception:
                 drive_has_space = False
@@ -3467,6 +3565,15 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
                     download_source="huggingface",
                 )
                 tok_cfg.download_if_necessary()
+            elif pipeline_arch == "minimax_h3_image":
+                MODEL_DOWNLOAD_STATE["message"] = "正在同步 MiniMax-H3-Image 模块化配置与 Diffusers>=0.43 运行时..."
+                ensure_minimax_h3_image_dependencies()
+                prepare_minimax_h3_image_assembled_dir(
+                    target_id=target_id,
+                    repo_id=repo_id or "MiniMaxAI/MiniMax-H3-Image",
+                    hf_token=hf_token,
+                    link_weights=False,
+                )
 
         MODEL_DOWNLOAD_STATE["progress"] = 1.0
         status = check_model_files_status(target_id)
@@ -3488,6 +3595,315 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
 
 def download_minimax_h3_weights_core(hf_token: str = "") -> Tuple[bool, str]:
     return download_model_weights_core("minimax_h3", hf_token)
+
+
+# ==============================================================================
+# 专属独立引擎：MiniMax-H3-Image (33B · 6步原生4K ModularPipeline + 共享编码器组装)
+# ==============================================================================
+MINIMAX_H3_IMAGE_CONFIG_PATTERNS = [
+    "modular_model_index.json",
+    "pdd_config.json",
+    "scheduler/*",
+    "tokenizer/*",
+    "processor/*",
+    "text_encoder/*.json",
+    "text_encoder/*.txt",
+    "transformer_diffusers/*.json",
+    "vae_diffusers/*.json",
+]
+
+MINIMAX_H3_IMAGE_REQUIRED_CONFIG_MARKERS = (
+    "modular_model_index.json",
+    "transformer_diffusers/config.json",
+    "vae_diffusers/config.json",
+    "text_encoder/config.json",
+    "scheduler/scheduler_config.json",
+    "tokenizer/tokenizer_config.json",
+    "processor/preprocessor_config.json",
+)
+
+
+def ensure_minimax_h3_image_dependencies() -> Tuple[Any, Any]:
+    """
+    确保当前环境已安装支持 MiniMaxH3ImageModularPipeline 的最新版 diffusers (>=0.43.0)。
+    若 Colab 预装版本较旧，自动静默升级并热刷新 sys.modules。
+    """
+    try:
+        from diffusers import ComponentsManager, ModularPipeline
+        from diffusers.modular_pipelines.minimax_h3_image import MiniMaxH3ImageModularPipeline  # noqa: F401
+
+        return ComponentsManager, ModularPipeline
+    except Exception:
+        print("[MiniMax-H3-Image] 检测到当前 diffusers 版本不含 MiniMaxH3ImageModularPipeline，正在升级 diffusers>=0.43.0 ...")
+        MODEL_DOWNLOAD_STATE["message"] = "正在自动升级 diffusers>=0.43.0 以支持 MiniMax-H3-Image 模块化管线..."
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "-U",
+                "diffusers>=0.43.0",
+                "transformers>=4.57.0",
+                "accelerate",
+            ]
+        )
+        import importlib
+
+        for mod_key in [k for k in list(sys.modules.keys()) if k == "diffusers" or k.startswith("diffusers.")]:
+            sys.modules.pop(mod_key, None)
+        importlib.invalidate_caches()
+        from diffusers import ComponentsManager, ModularPipeline
+        from diffusers.modular_pipelines.minimax_h3_image import MiniMaxH3ImageModularPipeline  # noqa: F401
+
+        print("[MiniMax-H3-Image] diffusers>=0.43.0 热升级校验通过！")
+        return ComponentsManager, ModularPipeline
+
+
+def prepare_minimax_h3_image_assembled_dir(
+    target_id: str = "minimax_h3_image",
+    repo_id: str = "MiniMaxAI/MiniMax-H3-Image",
+    hf_token: str = "",
+    link_weights: bool = True,
+    stage_nvme_if_low_ram: bool = False,
+) -> str:
+    """
+    在实例本地高速 ext4 文件系统构建 MiniMax-H3-Image 零拷贝软链组装目录：
+    1. 仅拉取 ~35MB 轻量配置文件 (modular_model_index.json / processor / tokenizer / config.json)，彻底跳过仓库内重复的 68.6GB SGLang 权重；
+    2. 在 Google Drive 挂载时双向缓存轻量配置文件，二次重启免联网校验；
+    3. 将 27 个必需 .safetensors 分片（含自动复用的 MiniMax-H3 FL2VA/text_encoder 66.7GB 编码器分片）软链至本地组装目录，规避云盘 FUSE 不支持软链问题。
+    """
+    assembled_dir = os.path.join(os.getcwd(), "models", "_assembled", target_id)
+    os.makedirs(assembled_dir, exist_ok=True)
+    _, _, drive_dir = _get_model_dirs(target_id)
+    drive_cfg_cache = os.path.join(drive_dir, "_modular_configs")
+
+    def _configs_complete(base_d: str) -> bool:
+        return all(os.path.exists(os.path.join(base_d, m)) for m in MINIMAX_H3_IMAGE_REQUIRED_CONFIG_MARKERS)
+
+    if not _configs_complete(assembled_dir):
+        if DRIVE_MOUNTED and _configs_complete(drive_cfg_cache):
+            shutil.copytree(drive_cfg_cache, assembled_dir, dirs_exist_ok=True)
+        if not _configs_complete(assembled_dir):
+            from huggingface_hub import snapshot_download
+
+            tok = (hf_token or os.environ.get("HF_TOKEN") or "").strip() or None
+            snapshot_download(
+                repo_id=repo_id or "MiniMaxAI/MiniMax-H3-Image",
+                local_dir=assembled_dir,
+                allow_patterns=MINIMAX_H3_IMAGE_CONFIG_PATTERNS,
+                token=tok,
+            )
+            if DRIVE_MOUNTED and os.path.exists("/content/drive/MyDrive"):
+                try:
+                    shutil.copytree(
+                        assembled_dir,
+                        drive_cfg_cache,
+                        dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("*.safetensors", ".cache*"),
+                    )
+                except Exception:
+                    pass
+
+    if not link_weights:
+        return assembled_dir
+
+    spec = MODEL_CATALOG.get(target_id, MODEL_CATALOG["minimax_h3_image"])
+    req_rel_names = [fn for fn, _ in spec["files"]]
+    resolved_paths: List[str] = []
+    for rel_fn in req_rel_names:
+        found = _find_existing_model_file(target_id, rel_fn)
+        if not found:
+            raise RuntimeError(f"未找到必需权重分片 {rel_fn}，请先点击「下载权重」。")
+        resolved_paths.append(found)
+
+    if stage_nvme_if_low_ram:
+        resolved_paths = _stage_model_files_to_local_nvme(
+            target_id, resolved_paths, req_rel_names, "MiniMax-H3-Image 模块化权重"
+        )
+
+    for rel_fn, src_path in zip(req_rel_names, resolved_paths):
+        dst_link = os.path.join(assembled_dir, rel_fn)
+        os.makedirs(os.path.dirname(dst_link), exist_ok=True)
+        abs_src = os.path.abspath(src_path)
+        if os.path.lexists(dst_link):
+            try:
+                if os.path.islink(dst_link) and os.path.abspath(os.path.realpath(dst_link)) == abs_src and os.path.exists(dst_link):
+                    continue
+                os.unlink(dst_link)
+            except Exception:
+                pass
+        os.symlink(abs_src, dst_link)
+
+    return assembled_dir
+
+
+def load_minimax_h3_image_pipeline(
+    target_id: str,
+    spec: Dict[str, Any],
+    total_vram_gb: float,
+    free_before_gb: float,
+    hf_token: str = "",
+) -> Tuple[Any, str]:
+    """
+    专用加载方法：装载 MiniMax-H3-Image (33B DiT + 32B VLM 编码器) 6 步原生 4K 模块化管线。
+    - 大显存 + 大内存机型 (如 G4 96GB / H100 80GB / A100 High-RAM，VRAM>=65GB 且可用 RAM>=132GB)：
+      采用官方 ComponentsManager(enable_auto_cpu_offload) 在 DDR5 系统内存与显存间整块极速轮换；
+    - 中等显存或标准内存机型 (如 A100 40GB / L4 24GB 或可用 RAM<132GB)：
+      按组件顺序加载并挂载 Diffusers Group Offloading (leaf_level + 磁盘/内存分层卸载) + 4K VAE Tiling，严防 OOM。
+    """
+    if total_vram_gb < 22.0:
+        raise RuntimeError(
+            f"当前 GPU 总显存 ({total_vram_gb:.1f} GB) 不足以运行 MiniMax-H3-Image (33B)！"
+            "请切换至 G4 (96GB，推荐)、H100 (80GB)、A100 或 L4 (24GB) 实例。"
+        )
+
+    MODEL_DOWNLOAD_STATE["progress"] = 0.22
+    ComponentsManager, ModularPipeline = ensure_minimax_h3_image_dependencies()
+    _trim_linux_cpu_heap()
+    total_ram_gb, avail_ram_gb = _get_system_ram_gb()
+    repo_id = spec.get("repo_id") or "MiniMaxAI/MiniMax-H3-Image"
+
+    MODEL_DOWNLOAD_STATE["progress"] = 0.34
+    MODEL_DOWNLOAD_STATE["message"] = "正在构建 MiniMax-H3-Image 本地零拷贝组装目录与共享编码器映射..."
+    assembled_dir = prepare_minimax_h3_image_assembled_dir(
+        target_id=target_id,
+        repo_id=repo_id,
+        hf_token=hf_token,
+        link_weights=True,
+        stage_nvme_if_low_ram=(avail_ram_gb < 132.0),
+    )
+
+    total_ram_gb, avail_ram_gb = _get_system_ram_gb()
+    if total_vram_gb >= 65.0 and avail_ram_gb >= 132.0:
+        MODEL_DOWNLOAD_STATE["progress"] = 0.56
+        MODEL_DOWNLOAD_STATE["message"] = (
+            f"正在通过 ComponentsManager 装载 MiniMax-H3-Image 至 {total_ram_gb:.0f}GB 内存热备池与 GPU..."
+        )
+        manager = ComponentsManager()
+        manager.enable_auto_cpu_offload(device="cuda")
+        pipe = ModularPipeline.from_pretrained(assembled_dir, components_manager=manager)
+        pipe.load_components(dtype=torch.bfloat16)
+        vae_mod = getattr(pipe, "vae", None)
+        if vae_mod is not None and total_vram_gb < 88.0 and hasattr(vae_mod, "enable_tiling"):
+            vae_mod.enable_tiling()
+        mode_label = f"{spec['name']} · BF16 原生 · ComponentsManager 内存热备"
+        print(
+            f"⚡ [MiniMax-H3-Image] 已启用官方 ComponentsManager 自动显存/内存热备轮换 "
+            f"(VRAM {total_vram_gb:.1f}GB / 可用 RAM {avail_ram_gb:.1f}GB)"
+        )
+        return pipe, mode_label
+
+    # 回退分支：中等显存 (<65GB) 或标准主机内存 (<132GB) 分组件顺序装载 + Group Offloading
+    from diffusers.hooks import apply_group_offloading
+
+    use_disk_offload = avail_ram_gb < 132.0
+    offload_root = os.path.join(os.getcwd(), "models", "_offload_cache", target_id)
+    if use_disk_offload:
+        os.makedirs(offload_root, exist_ok=True)
+
+    pipe = ModularPipeline.from_pretrained(assembled_dir)
+    MODEL_DOWNLOAD_STATE["progress"] = 0.42
+    MODEL_DOWNLOAD_STATE["message"] = "正在加载 MiniMax-H3-Image 调度器与多模态 Processor..."
+    pipe.load_components(names=["scheduler", "tokenizer", "processor"])
+
+    MODEL_DOWNLOAD_STATE["progress"] = 0.54
+    MODEL_DOWNLOAD_STATE["message"] = "正在分层装载 32B 视觉文本编码器 (1/3)..."
+    pipe.load_components(names="text_encoder", dtype=torch.bfloat16)
+    te_disk = os.path.join(offload_root, "text_encoder") if use_disk_offload else None
+    if te_disk:
+        os.makedirs(te_disk, exist_ok=True)
+    apply_group_offloading(
+        pipe.text_encoder,
+        onload_device=torch.device("cuda"),
+        offload_device=torch.device("cpu"),
+        offload_type="leaf_level",
+        use_stream=not use_disk_offload,
+        low_cpu_mem_usage=True,
+        offload_to_disk_path=te_disk,
+    )
+    _trim_linux_cpu_heap()
+
+    MODEL_DOWNLOAD_STATE["progress"] = 0.74
+    MODEL_DOWNLOAD_STATE["message"] = "正在分层装载 33B 图像 DiT 主干 (2/3)..."
+    pipe.load_components(names="transformer", dtype=torch.bfloat16)
+    dit_disk = os.path.join(offload_root, "transformer") if use_disk_offload else None
+    if dit_disk:
+        os.makedirs(dit_disk, exist_ok=True)
+    apply_group_offloading(
+        pipe.transformer,
+        onload_device=torch.device("cuda"),
+        offload_device=torch.device("cpu"),
+        offload_type="leaf_level",
+        use_stream=not use_disk_offload,
+        low_cpu_mem_usage=True,
+        offload_to_disk_path=dit_disk,
+    )
+    _trim_linux_cpu_heap()
+
+    MODEL_DOWNLOAD_STATE["progress"] = 0.88
+    MODEL_DOWNLOAD_STATE["message"] = "正在装载 4K 16MP 图像 VAE 并开启分块解码保护 (3/3)..."
+    pipe.load_components(names="vae", dtype=torch.bfloat16)
+    if hasattr(pipe.vae, "enable_tiling"):
+        pipe.vae.enable_tiling()
+    apply_group_offloading(
+        pipe.vae,
+        onload_device=torch.device("cuda"),
+        offload_device=torch.device("cpu"),
+        offload_type="leaf_level",
+        use_stream=False,
+    )
+    _trim_linux_cpu_heap()
+    tag_suffix = "NVMe 分层卸载" if use_disk_offload else "分层流式卸载"
+    return pipe, f"{spec['name']} · BF16 · {tag_suffix}"
+
+
+def run_minimax_h3_image_inference(
+    active_pipe: Any,
+    prompt: str,
+    width: int,
+    height: int,
+    seed: int,
+    ref_images: Optional[List[Any]] = None,
+) -> Any:
+    """
+    专用推理方法：调用 MiniMaxH3ImageModularPipeline 执行 6 步 PDD 蒸馏原生 4K 文生图或多参考图编辑。
+    注意：该管线固定 6 步输出头且已蒸馏 CFG，严禁传入 num_inference_steps / guidance_scale / negative_prompt，
+    必须显式指定 output="images" 获取 PIL.Image 列表。
+    """
+    w = max(512, (int(width) // 32) * 32)
+    h = max(512, (int(height) // 32) * 32)
+    clean_prompt = (prompt or "").strip() or "Ultra-detailed 4K commercial photography, natural lighting, sharp focus."
+
+    def _invoke_once(seed_val: int):
+        gen = torch.Generator(device="cpu").manual_seed(int(seed_val))
+        call_kw: Dict[str, Any] = {
+            "prompt": clean_prompt,
+            "height": h,
+            "width": w,
+            "generator": gen,
+            "output": "images",
+        }
+        valid_refs = [im.convert("RGB") if hasattr(im, "convert") else im for im in (ref_images or []) if im is not None]
+        if valid_refs:
+            call_kw["image"] = valid_refs if len(valid_refs) > 1 else valid_refs[0]
+        out = active_pipe(**call_kw)
+        if isinstance(out, (list, tuple)):
+            return out[0]
+        if hasattr(out, "images") and out.images:
+            return out.images[0]
+        return out
+
+    try:
+        return _invoke_once(int(seed))
+    except torch.cuda.OutOfMemoryError:
+        print("[MiniMax-H3-Image] 检测到高分辨率解码显存峰值，自动开启 VAE Tiling 并清理瞬态缓存重试...")
+        _reclaim_transient_gpu_memory()
+        vae_mod = getattr(active_pipe, "vae", None)
+        if vae_mod is not None and hasattr(vae_mod, "enable_tiling"):
+            vae_mod.enable_tiling()
+        return _invoke_once(int(seed))
 
 
 # ==============================================================================
@@ -4055,31 +4471,62 @@ def _trim_linux_cpu_heap():
             pass
 
 
+def _release_pipeline_object(pipe_obj: Any):
+    """主动解除 ModularPipeline / ComponentsManager / Accelerate Hook 的循环引用，确保 125GB+ CPU/GPU 权重立即释放"""
+    if pipe_obj is None:
+        return
+    try:
+        cm = getattr(pipe_obj, "components_manager", None)
+        if cm is not None:
+            for attr_dict_name in ("components", "_components", "_offload_hooks"):
+                d = getattr(cm, attr_dict_name, None)
+                if isinstance(d, dict):
+                    d.clear()
+        for sub_attr in ("transformer", "text_encoder", "vae", "dit", "video_vae", "audio_vae"):
+            sub_mod = getattr(pipe_obj, sub_attr, None)
+            if sub_mod is not None:
+                try:
+                    from diffusers.hooks import remove_group_offloading
+                    remove_group_offloading(sub_mod)
+                except Exception:
+                    pass
+                try:
+                    setattr(pipe_obj, sub_attr, None)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _unload_model_locked(model_id: Optional[str] = None) -> List[str]:
     """在已持有 GPU_LOCK 的前提下卸载指定模型（或全部模型），返回被卸载的模型名称列表"""
     global PIPELINE, LLM_BUNDLE, LOADED_MODEL_ID, CURRENT_MODEL_MODE
+    norm_id = _normalize_builtin_model_alias(model_id) if (model_id and model_id != "all") else model_id
     removed_names: List[str] = []
-    if not model_id or model_id == "all":
+    if not norm_id or norm_id == "all":
         for mid in list(LOADED_RUNTIMES.keys()):
             entry = LOADED_RUNTIMES.pop(mid, None)
             if entry:
                 _stop_gguf_server_bundle(entry.get("llm_bundle"))
+                _release_pipeline_object(entry.get("pipeline"))
                 removed_names.append(entry.get("name", mid))
                 entry.clear()
         _stop_gguf_server_bundle(LLM_BUNDLE)
+        _release_pipeline_object(PIPELINE)
         PIPELINE = None
         LLM_BUNDLE = None
         LOADED_MODEL_ID = None
         CURRENT_MODEL_MODE = None
-    elif model_id in LOADED_RUNTIMES:
-        entry = LOADED_RUNTIMES.pop(model_id, None)
+    elif norm_id in LOADED_RUNTIMES:
+        entry = LOADED_RUNTIMES.pop(norm_id, None)
         if entry:
             _stop_gguf_server_bundle(entry.get("llm_bundle"))
-            removed_names.append(entry.get("name", model_id))
             if PIPELINE is entry.get("pipeline"):
                 PIPELINE = None
             if LLM_BUNDLE is entry.get("llm_bundle"):
                 LLM_BUNDLE = None
+            _release_pipeline_object(entry.get("pipeline"))
+            removed_names.append(entry.get("name", norm_id))
             entry.clear()
         _sync_legacy_globals()
 
@@ -4127,10 +4574,11 @@ def unload_model_from_vram_core(model_id: Optional[str] = None) -> Tuple[bool, s
 
 def _ensure_vram_for_new_model_locked(target_id: str, required_free_gb: float) -> List[str]:
     """
-    多模型共驻智能显存守卫 (LRU Eviction)：
+    多模型共驻智能显存与系统内存守卫 (LRU Eviction)：
     - 若目标模型自身已在显存中，先卸载旧实例以便重载；
-    - 若剩余可用显存 >= required_free_gb，保留所有已加载模型实现多模型同时常驻！
-    - 仅当剩余显存不足以容纳新模型时，按最早加载顺序 (LRU) 自动腾退旧模型，防止 CUDA OOM。
+    - 若已有 ComponentsManager / 内存热备型 33B 巨型管线驻留，按其前向峰值 (~64GB VRAM) 与系统内存余量核算可用空间，
+      使 Qwen3.8-GGUF (~21GB) 在 G4 96GB 上可与其安全共驻，而切换到另一巨型模型时自动先腾退旧实例释放 125GB+ 内存！
+    - 仅当剩余可用空间不足以容纳新模型时，按最早加载顺序 (LRU) 自动腾退旧模型，防止 CUDA / Cgroup OOM。
     """
     evicted: List[str] = []
     if target_id in LOADED_RUNTIMES:
@@ -4139,12 +4587,39 @@ def _ensure_vram_for_new_model_locked(target_id: str, required_free_gb: float) -
     if not torch.cuda.is_available():
         return evicted
 
-    free_gb = torch.cuda.mem_get_info("cuda")[0] / (1024 ** 3)
-    while free_gb < required_free_gb and LOADED_RUNTIMES:
+    def _effective_free_vram_gb() -> float:
+        free_b, total_b = torch.cuda.mem_get_info("cuda")
+        raw_free = free_b / (1024 ** 3)
+        total_v = total_b / (1024 ** 3)
+        used_v = max(0.0, total_v - raw_free)
+        # ComponentsManager 在空闲期将 62GB 主干暂存 CPU 内存（当前显存占用接近 0），推理期需瞬时占用 ~64GB 显存
+        has_cpu_offloaded_giant = any(
+            mid in ("minimax_h3", "minimax_h3_image")
+            or "ComponentsManager" in str(rt.get("mode_label", ""))
+            or "内存热备" in str(rt.get("mode_label", ""))
+            for mid, rt in LOADED_RUNTIMES.items()
+        )
+        if has_cpu_offloaded_giant and used_v < 58.0:
+            reserved_peak = 64.0
+            return min(raw_free, max(0.0, total_v - max(used_v, reserved_peak)))
+        return raw_free
+
+    target_spec = MODEL_CATALOG.get(target_id, {})
+    target_arch = target_spec.get("pipeline_arch") or target_id
+    needs_heavy_cpu_ram = target_arch in ("minimax_h3", "minimax_h3_image")
+
+    while LOADED_RUNTIMES:
+        eff_free = _effective_free_vram_gb()
+        _, avail_ram = _get_system_ram_gb()
+        ram_short = needs_heavy_cpu_ram and avail_ram < 132.0 and any(
+            "内存热备" in str(rt.get("mode_label", "")) or "ComponentsManager" in str(rt.get("mode_label", ""))
+            for rt in LOADED_RUNTIMES.values()
+        )
+        if eff_free >= required_free_gb and not ram_short:
+            break
         oldest_id = next(iter(LOADED_RUNTIMES))
         names = _unload_model_locked(oldest_id)
         evicted.extend(names)
-        free_gb = torch.cuda.mem_get_info("cuda")[0] / (1024 ** 3)
     return evicted
 
 
@@ -4199,7 +4674,8 @@ def load_model_to_vram_core(
     if not torch.cuda.is_available():
         return False, "未检测到 CUDA GPU！请在 Colab 中切换为 G4 / A100 / L4 GPU。"
 
-    target_id = model_id if (model_id and model_id in MODEL_CATALOG) else SELECTED_MODEL_ID
+    norm_id = _normalize_builtin_model_alias(model_id)
+    target_id = norm_id if (norm_id and norm_id in MODEL_CATALOG) else SELECTED_MODEL_ID
     SELECTED_MODEL_ID = target_id
     spec = MODEL_CATALOG[target_id]
     pipeline_arch = spec.get("pipeline_arch") or target_id
@@ -4242,9 +4718,9 @@ def load_model_to_vram_core(
             elif pipeline_arch in ("qwen38_27b_gguf", "gguf"):
                 q4_kv_gb = (ctx_len / 262144.0) * 4.6
                 required_free_gb = min(max(12.0, approx_gb + 2.0 + q4_kv_gb), max(12.0, total_vram_gb - 1.2))
-            elif pipeline_arch == "minimax_h3":
-                # BF16 单阶段峰值约 62.1GB；在 G4 (96GB) 上可与 Qwen3.8-GGUF (~21GB) 同时共驻显存
-                required_free_gb = min(64.5, max(24.0, total_vram_gb - 5.0))
+            elif pipeline_arch in ("minimax_h3", "minimax_h3_image"):
+                # BF16 单阶段峰值约 62.5GB；在 G4 (96GB) 上可与 Qwen3.8-GGUF (~21GB) 同时共驻显存
+                required_free_gb = min(65.0, max(24.0, total_vram_gb - 5.0))
             elif pipeline_arch == "transformers":
                 required_free_gb = min(max(12.0, approx_gb + 3.0), max(12.0, total_vram_gb - 1.5))
             else:
@@ -4443,6 +4919,15 @@ def load_model_to_vram_core(
                 )
                 _enable_high_vram_optimizations(new_pipe, total_vram_gb=total_vram_gb, preload_vram=True)
                 mode_label = f"{spec['name']} · 8步极速 BF16"
+
+            elif pipeline_arch == "minimax_h3_image":
+                new_pipe, mode_label = load_minimax_h3_image_pipeline(
+                    target_id=target_id,
+                    spec=spec,
+                    total_vram_gb=total_vram_gb,
+                    free_before_gb=free_before_gb,
+                    hf_token=hf_token,
+                )
 
             elif pipeline_arch == "diffusers_image":
                 MODEL_DOWNLOAD_STATE["progress"] = 0.45
@@ -7671,6 +8156,33 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                         img_out = None
                         call_kw.clear()
 
+                    elif pipeline_arch == "minimax_h3_image":
+                        filename = f"minimax_h3_image_{req.task_mode}_{timestamp}_seed{current_seed}.png"
+                        output_path = os.path.join(DEFAULT_OUTPUT_DIR, filename)
+                        w, h = int(req.width), int(req.height)
+                        ref_imgs = [im for im in (first_img, last_img) if im is not None] if req.task_mode == "i2i_edit" else None
+                        JOBS[job_id]["progress"] = round(base_prog + 0.18 * span_prog, 3)
+                        JOBS[job_id]["message"] = f"{prefix}正在执行 MiniMax-H3-Image 6 步 PDD 蒸馏原生超清采样 ({w}×{h})..."
+                        with CONSOLE_LOCK:
+                            ACTIVE_TQDM_BARS["sampling"] = (
+                                f"MiniMax-H3-Image 采样:  25%|##5       | 6 步 PDD 蒸馏推理中 ({w}×{h})..."
+                            )
+                        img_out = run_minimax_h3_image_inference(
+                            active_pipe=active_pipe,
+                            prompt=req.visual_prompt,
+                            width=w,
+                            height=h,
+                            seed=int(current_seed),
+                            ref_images=ref_imgs,
+                        )
+                        if job_cancel_event.is_set() or ABORT_GENERATION_EVENT.is_set():
+                            raise GenerationAbortedError("已手动停止当前推理任务")
+                        JOBS[job_id]["progress"] = round(base_prog + 0.96 * span_prog, 3)
+                        JOBS[job_id]["message"] = f"{prefix}正在写入无损 PNG 图像文件 (96%)..."
+                        img_out.save(output_path)
+                        img_out = None
+                        ref_imgs = None
+
                     elif pipeline_arch == "diffusers_image":
                         filename = f"{active_model_id}_{req.task_mode}_{timestamp}_seed{current_seed}.png"
                         output_path = os.path.join(DEFAULT_OUTPUT_DIR, filename)
@@ -8566,16 +9078,17 @@ def attach_macos_api_routes(app: FastAPI):
     @app.post("/minimax_api/select_model")
     def api_select_model(req: SelectModelRequest):
         touch_activity()
-        if req.model_id and req.model_id not in MODEL_CATALOG and req.repo_id:
+        norm_id = _normalize_builtin_model_alias(req.model_id, req.repo_id or "")
+        if norm_id and norm_id not in MODEL_CATALOG and req.repo_id:
             register_custom_hf_model_core(
                 repo_id=req.repo_id,
                 custom_name=req.custom_name,
                 include_pattern=req.include_pattern,
                 modality=req.modality or "auto",
                 hf_token=req.hf_token,
-                model_id_override=req.model_id,
+                model_id_override=norm_id,
             )
-        return get_gpu_status_dict(model_id=req.model_id)
+        return get_gpu_status_dict(model_id=norm_id)
 
     @app.post("/minimax_api/config_idle")
     def api_config_idle(req: IdleConfigRequest):
@@ -8641,7 +9154,7 @@ def attach_macos_api_routes(app: FastAPI):
         res = get_gpu_status_dict(model_id=spec["id"] if (ok and spec) else SELECTED_MODEL_ID)
         res["action_ok"] = ok
         res["action_message"] = msg
-        if spec:
+        if spec and spec.get("is_custom"):
             res["registered_model"] = {
                 "id": spec["id"],
                 "name": spec["name"],
@@ -8695,6 +9208,7 @@ def attach_macos_api_routes(app: FastAPI):
             {"id": "qwen3.8-27b", "object": "model", "created": now_ts, "owned_by": "qwen", "loaded": any_qwen_loaded},
             {"id": "Qwen/Qwen-Image-2.1", "object": "model", "created": now_ts, "owned_by": "qwen", "loaded": "qwen_image_21" in LOADED_RUNTIMES},
             {"id": "Tongyi-MAI/Z-Image-Turbo", "object": "model", "created": now_ts, "owned_by": "tongyi", "loaded": "z_image_turbo" in LOADED_RUNTIMES},
+            {"id": "MiniMaxAI/MiniMax-H3-Image", "object": "model", "created": now_ts, "owned_by": "minimax", "loaded": "minimax_h3_image" in LOADED_RUNTIMES},
             {"id": "MiniMaxAI/MiniMax-H3", "object": "model", "created": now_ts, "owned_by": "minimax", "loaded": "minimax_h3" in LOADED_RUNTIMES},
         ]
         for cm in _get_custom_models_public_list():
@@ -8952,12 +9466,14 @@ def attach_macos_api_routes(app: FastAPI):
         body = await request.json()
         req_model_str = str(body.get("model") or "").lower()
         img_target_id: Optional[str] = None
-        if ("z-image" in req_model_str or "z_image" in req_model_str) and "z_image_turbo" in LOADED_RUNTIMES:
+        if ("minimax" in req_model_str or "h3-image" in req_model_str or "h3_image" in req_model_str) and "minimax_h3_image" in LOADED_RUNTIMES:
+            img_target_id = "minimax_h3_image"
+        elif ("z-image" in req_model_str or "z_image" in req_model_str) and "z_image_turbo" in LOADED_RUNTIMES:
             img_target_id = "z_image_turbo"
         elif "qwen" in req_model_str and "qwen_image_21" in LOADED_RUNTIMES:
             img_target_id = "qwen_image_21"
         else:
-            for cand in ("z_image_turbo", "qwen_image_21"):
+            for cand in ("minimax_h3_image", "z_image_turbo", "qwen_image_21"):
                 if cand in LOADED_RUNTIMES:
                     img_target_id = cand
                     break
@@ -8965,17 +9481,18 @@ def attach_macos_api_routes(app: FastAPI):
         if not img_target_id:
             return JSONResponse(
                 status_code=503,
-                content={"error": {"message": "请先在客户端加载 Qwen-Image-2.1 或 Z-Image-Turbo 至显存（可与 Qwen3.8-27B 同时常驻）。", "type": "server_error"}},
+                content={"error": {"message": "请先在客户端加载 MiniMax-H3-Image、Qwen-Image-2.1 或 Z-Image-Turbo 至显存。", "type": "server_error"}},
             )
 
         img_pipe = LOADED_RUNTIMES[img_target_id]["pipeline"]
         API_REQUEST_COUNT += 1
         prompt = body.get("prompt", "")
-        size_str = str(body.get("size", "1024x1024")).lower()
+        default_sz = "2048x2048" if img_target_id == "minimax_h3_image" else "1024x1024"
+        size_str = str(body.get("size", default_sz)).lower()
         try:
             w, h = [int(x) for x in size_str.split("x", 1)]
         except Exception:
-            w, h = 1024, 1024
+            w, h = (2048, 2048) if img_target_id == "minimax_h3_image" else (1024, 1024)
         n = max(1, min(4, int(body.get("n", 1))))
         steps = int(body.get("steps") or (8 if img_target_id == "z_image_turbo" else 40))
 
@@ -8983,7 +9500,15 @@ def attach_macos_api_routes(app: FastAPI):
         with GPU_LOCK:
             for _ in range(n):
                 cur_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
-                if img_target_id == "z_image_turbo":
+                if img_target_id == "minimax_h3_image":
+                    img = run_minimax_h3_image_inference(
+                        active_pipe=img_pipe,
+                        prompt=prompt,
+                        width=w,
+                        height=h,
+                        seed=cur_seed,
+                    )
+                elif img_target_id == "z_image_turbo":
                     img = img_pipe(prompt=prompt, width=w, height=h, num_inference_steps=steps, seed=cur_seed, rand_device="cuda")
                 else:
                     img = img_pipe(prompt=prompt, negative_prompt=" ", width=w, height=h, num_inference_steps=steps, seed=cur_seed)
@@ -9314,16 +9839,17 @@ def attach_macos_api_routes(app: FastAPI):
     @app.post("/minimax_api/download_model")
     def api_download_model(req: DownloadModelRequest):
         touch_activity()
-        if req.model_id and req.model_id not in MODEL_CATALOG and req.repo_id:
+        norm_id = _normalize_builtin_model_alias(req.model_id, req.repo_id or "")
+        if norm_id and norm_id not in MODEL_CATALOG and req.repo_id:
             register_custom_hf_model_core(
                 repo_id=req.repo_id,
                 custom_name=req.custom_name,
                 include_pattern=req.include_pattern,
                 modality=req.modality or "auto",
                 hf_token=req.hf_token,
-                model_id_override=req.model_id,
+                model_id_override=norm_id,
             )
-        target_id = req.model_id if (req.model_id and req.model_id in MODEL_CATALOG) else SELECTED_MODEL_ID
+        target_id = norm_id if (norm_id and norm_id in MODEL_CATALOG) else SELECTED_MODEL_ID
         if not MODEL_DOWNLOAD_STATE["is_downloading"]:
             t = threading.Thread(
                 target=download_model_weights_core,
@@ -9339,16 +9865,17 @@ def attach_macos_api_routes(app: FastAPI):
         touch_activity()
         if req.context_length is not None:
             QWEN_CONTEXT_LENGTH = _clamp_context_length(req.context_length)
-        if req.model_id and req.model_id not in MODEL_CATALOG and req.repo_id:
+        norm_id = _normalize_builtin_model_alias(req.model_id, req.repo_id or "")
+        if norm_id and norm_id not in MODEL_CATALOG and req.repo_id:
             register_custom_hf_model_core(
                 repo_id=req.repo_id,
                 custom_name=req.custom_name,
                 include_pattern=req.include_pattern,
                 modality=req.modality or "auto",
                 hf_token=req.hf_token,
-                model_id_override=req.model_id,
+                model_id_override=norm_id,
             )
-        target_id = req.model_id if (req.model_id and req.model_id in MODEL_CATALOG) else SELECTED_MODEL_ID
+        target_id = norm_id if (norm_id and norm_id in MODEL_CATALOG) else SELECTED_MODEL_ID
         if not MODEL_DOWNLOAD_STATE["is_loading_vram"]:
             t = threading.Thread(
                 target=load_model_to_vram_core,
@@ -9393,11 +9920,13 @@ def attach_macos_api_routes(app: FastAPI):
     @app.post("/minimax_api/generate")
     def api_generate(req: GenerateVideoRequest):
         touch_activity()
+        norm_req_id = _normalize_builtin_model_alias(req.model_id)
         target_model_id = (
-            req.model_id
-            if (req.model_id and req.model_id in MODEL_CATALOG)
+            norm_req_id
+            if (norm_req_id and norm_req_id in MODEL_CATALOG)
             else SELECTED_MODEL_ID
         )
+        req.model_id = target_model_id
         if not LOADED_RUNTIMES and PIPELINE is None and LLM_BUNDLE is None:
             return {
                 "job_id": "none",

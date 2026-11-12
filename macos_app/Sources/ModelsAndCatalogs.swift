@@ -203,6 +203,55 @@ let OPEN_MODEL_CATALOG: [OpenModelSpec] = [
         ]
     ),
     OpenModelSpec(
+        id: "minimax_h3_image",
+        nameZh: "MiniMax-H3-Image (33B · 4K)",
+        nameEn: "MiniMax-H3-Image (33B · 4K)",
+        repoId: "MiniMaxAI/MiniMax-H3-Image",
+        badgeZh: "6步原生4K · 135 GB (共享省67G)",
+        badgeEn: "6-Step Native 4K · 135 GB",
+        summaryZh: "MiniMax 33B 6步蒸馏原生 4K (16MP) 商业摄影、双语海报排版与多参考图编辑旗舰（与 MiniMax-H3 零拷贝共享 66.7GB 编码器）",
+        summaryEn: "MiniMax 33B 6-step distilled native 4K (16MP) photorealistic image generation & multi-reference instruction editing (shares 66.7GB encoder with MiniMax-H3)",
+        approxSizeGB: 135.3,
+        icon: "camera.aperture",
+        modality: .image,
+        defaultSteps: 6,
+        modes: [
+            TaskModeItem(
+                id: "t2i",
+                titleZh: "6 步原生 4K 文生图",
+                titleEn: "6-Step Native 4K Text-to-Image",
+                subtitleZh: "6 步 PDD 蒸馏直出 4MP~16MP (4K) 超清商业大片与高密度中英文海报排版",
+                subtitleEn: "6-step PDD distilled native 4MP–16MP (4K) commercial photography & dense bilingual poster typography",
+                icon: "camera.metering.matrix"
+            ),
+            TaskModeItem(
+                id: "i2i_edit",
+                titleZh: "多参考图指令修图",
+                titleEn: "Multi-Image Instruction Edit",
+                subtitleZh: "上传 1~2 张参考图（可用 <Picture 1> / <Picture 2> 指代）进行精准修图与主体融合",
+                subtitleEn: "Upload 1–2 reference images (refer via <Picture 1> / <Picture 2>) for precise editing & subject fusion",
+                icon: "wand.and.stars"
+            )
+        ],
+        defaultFiles: (1...12).map { i in
+            ModelFileItem(
+                name: String(format: "transformer_diffusers/diffusion_pytorch_model-%05d-of-00012.safetensors", i),
+                desc: "33B 图像 DiT 主干 \(i)/12",
+                exists: false,
+                size_gb: 0
+            )
+        } + (1...14).map { i in
+            ModelFileItem(
+                name: String(format: "text_encoder/model-%05d-of-00014.safetensors", i),
+                desc: "32B 多模态编码器 \(i)/14 (共享)",
+                exists: false,
+                size_gb: 0
+            )
+        } + [
+            ModelFileItem(name: "vae_diffusers/diffusion_pytorch_model.safetensors", desc: "4K 16MP 图像 VAE (2.3 GB)", exists: false, size_gb: 0)
+        ]
+    ),
+    OpenModelSpec(
         id: "comfyui_studio",
         nameZh: "ComfyUI 节点工作台",
         nameEn: "ComfyUI Node Studio",
@@ -445,6 +494,15 @@ let IMAGE_RESOLUTIONS: [ResolutionOption] = [
     ResolutionOption(id: "i_1344_768", labelZh: "1344 × 768 (16:9 电影横幅)", labelEn: "1344 × 768 (16:9 Cinematic Widescreen)", width: 1344, height: 768),
     ResolutionOption(id: "i_768_1344", labelZh: "768 × 1344 (9:16 竖版海报)", labelEn: "768 × 1344 (9:16 Vertical Poster)", width: 768, height: 1344),
     ResolutionOption(id: "i_1536_1024", labelZh: "1536 × 1024 (3:2 单反摄影)", labelEn: "1536 × 1024 (3:2 DSLR Photo)", width: 1536, height: 1024)
+]
+
+let MINIMAX_H3_IMAGE_RESOLUTIONS: [ResolutionOption] = [
+    ResolutionOption(id: "mh3i_2048_2048", labelZh: "2048 × 2048 (1:1 4MP 极速超清 · 推荐)", labelEn: "2048 × 2048 (1:1 4MP Ultra HD · Recommended)", width: 2048, height: 2048),
+    ResolutionOption(id: "mh3i_4096_4096", labelZh: "4096 × 4096 (1:1 16MP 原生 4K 巨幅)", labelEn: "4096 × 4096 (1:1 16MP Native 4K Square)", width: 4096, height: 4096),
+    ResolutionOption(id: "mh3i_5472_3072", labelZh: "5472 × 3072 (16:9 16MP 电影超宽 4K)", labelEn: "5472 × 3072 (16:9 16MP Cinematic 4K)", width: 5472, height: 3072),
+    ResolutionOption(id: "mh3i_3072_5472", labelZh: "3072 × 5472 (9:16 16MP 竖版巨幅 4K)", labelEn: "3072 × 5472 (9:16 16MP Vertical Poster 4K)", width: 3072, height: 5472),
+    ResolutionOption(id: "mh3i_4736_3552", labelZh: "4736 × 3552 (4:3 16MP 商业摄影 4K)", labelEn: "4736 × 3552 (4:3 16MP Commercial 4K)", width: 4736, height: 3552),
+    ResolutionOption(id: "mh3i_3552_4736", labelZh: "3552 × 4736 (3:4 16MP 杂志人像 4K)", labelEn: "3552 × 4736 (3:4 16MP Editorial Portrait 4K)", width: 3552, height: 4736)
 ]
 
 struct PresetTemplate: Identifiable {

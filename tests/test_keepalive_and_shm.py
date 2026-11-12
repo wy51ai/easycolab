@@ -334,5 +334,212 @@ class HighTierAllocationReconciliationTest(unittest.TestCase):
         self.assertEqual(len(unassigned), 2)
 
 
+def _load_minimax_h3_image_helpers(tmp_root: str):
+    import json
+    import re
+    import shutil
+    from typing import Any, Dict, List, Optional, Tuple
+
+    with open(APP_PY_PATH, "r", encoding="utf-8") as f:
+        source = f.read()
+    tree = ast.parse(source, filename=APP_PY_PATH)
+    wanted_assigns = {
+        "MINIMAX_H3_BF16_FILES",
+        "MODEL_CATALOG",
+        "MINIMAX_H3_IMAGE_FILES",
+        "BUILTIN_MODEL_IDS",
+        "MINIMAX_H3_IMAGE_CONFIG_PATTERNS",
+        "MINIMAX_H3_IMAGE_REQUIRED_CONFIG_MARKERS",
+    }
+    wanted_funcs = {
+        "_normalize_builtin_model_alias",
+        "_normalize_hf_repo_and_pattern",
+        "inspect_and_resolve_hf_repo",
+        "_get_model_dirs",
+        "_find_existing_model_file",
+        "prepare_minimax_h3_image_assembled_dir",
+        "run_minimax_h3_image_inference",
+    }
+    selected = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id in wanted_assigns for t in node.targets):
+                selected.append(node)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id in wanted_assigns:
+            selected.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in wanted_funcs:
+            selected.append(node)
+
+    mod = ast.Module(body=selected, type_ignores=[])
+    ast.fix_missing_locations(mod)
+
+    class _FakeOOMError(RuntimeError):
+        pass
+
+    class _FakeGenerator:
+        def __init__(self, device="cpu"):
+            self.device = device
+            self.seed = None
+
+        def manual_seed(self, s):
+            self.seed = s
+            return self
+
+    fake_torch = mock.MagicMock()
+    fake_torch.Generator = _FakeGenerator
+    fake_torch.cuda.OutOfMemoryError = _FakeOOMError
+
+    ns = {
+        "os": os,
+        "re": re,
+        "json": json,
+        "shutil": shutil,
+        "Any": Any,
+        "Dict": Dict,
+        "List": List,
+        "Optional": Optional,
+        "Tuple": Tuple,
+        "torch": fake_torch,
+        "DRIVE_MOUNTED": False,
+        "MODEL_BASE_ROOT": os.path.join(tmp_root, "drive_models"),
+        "LEGACY_DRIVE_MODEL_ROOTS": [],
+        "_safe_shm_available_bytes": lambda reserve_ram_gb=34.0: 0,
+        "_stage_model_files_to_local_nvme": lambda mid, paths, rels, lbl: paths,
+        "_reclaim_transient_gpu_memory": mock.MagicMock(),
+    }
+    exec(compile(mod, APP_PY_PATH, "exec"), ns)
+    return ns, _FakeOOMError
+
+
+class MiniMaxH3ImageEngineTest(unittest.TestCase):
+    def test_catalog_and_custom_import_resolution_excludes_sglang_duplicates(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ns, _ = _load_minimax_h3_image_helpers(tmp)
+            spec = ns["MODEL_CATALOG"]["minimax_h3_image"]
+            files = [fn for fn, _ in spec["files"]]
+            self.assertEqual(len(files), 27)
+            self.assertTrue(all(not fn.startswith("transformer/model-") for fn in files))
+            self.assertNotIn("vae/diffusion_pytorch_model.safetensors", files)
+            self.assertIn("transformer_diffusers/diffusion_pytorch_model-00001-of-00012.safetensors", files)
+            self.assertIn("vae_diffusers/diffusion_pytorch_model.safetensors", files)
+
+            resolved_img = ns["inspect_and_resolve_hf_repo"]("https://huggingface.co/MiniMaxAI/MiniMax-H3-Image")
+            self.assertEqual(resolved_img["modality"], "image")
+            self.assertEqual(resolved_img["pipeline_arch"], "minimax_h3_image")
+            self.assertEqual(len(resolved_img["files"]), 27)
+
+            resolved_vid = ns["inspect_and_resolve_hf_repo"]("https://huggingface.co/MiniMaxAI/MiniMax-H3")
+            self.assertEqual(resolved_vid["modality"], "video_audio")
+            self.assertEqual(resolved_vid["pipeline_arch"], "minimax_h3")
+
+            self.assertEqual(
+                ns["_normalize_builtin_model_alias"]("custom_minimaxai_minimax_h3_image"),
+                "minimax_h3_image",
+            )
+
+    def test_shared_text_encoder_zero_copy_and_local_symlink_assembly(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ns, _ = _load_minimax_h3_image_helpers(tmp)
+            with mock.patch("os.getcwd", return_value=tmp):
+                # Populate 14 text_encoder shards ONLY under MiniMax-H3's FL2VA/text_encoder
+                h3_drive = os.path.join(tmp, "drive_models", "MiniMaxAI/MiniMax-H3")
+                for i in range(1, 15):
+                    p = os.path.join(h3_drive, f"FL2VA/text_encoder/model-{i:05d}-of-00014.safetensors")
+                    os.makedirs(os.path.dirname(p), exist_ok=True)
+                    with open(p, "wb") as wf:
+                        wf.write(b"T" * (80 * 1024))
+
+                # Populate 12 transformer_diffusers + 1 vae_diffusers under MiniMax-H3-Image
+                img_drive = os.path.join(tmp, "drive_models", "MiniMaxAI/MiniMax-H3-Image")
+                for i in range(1, 13):
+                    p = os.path.join(
+                        img_drive,
+                        f"transformer_diffusers/diffusion_pytorch_model-{i:05d}-of-00012.safetensors",
+                    )
+                    os.makedirs(os.path.dirname(p), exist_ok=True)
+                    with open(p, "wb") as wf:
+                        wf.write(b"D" * (80 * 1024))
+                vae_p = os.path.join(img_drive, "vae_diffusers/diffusion_pytorch_model.safetensors")
+                os.makedirs(os.path.dirname(vae_p), exist_ok=True)
+                with open(vae_p, "wb") as wf:
+                    wf.write(b"V" * (80 * 1024))
+
+                # Pre-populate lightweight config markers so no network call is needed
+                assembled_expected = os.path.join(tmp, "models", "_assembled", "minimax_h3_image")
+                for marker in ns["MINIMAX_H3_IMAGE_REQUIRED_CONFIG_MARKERS"]:
+                    mp = os.path.join(assembled_expected, marker)
+                    os.makedirs(os.path.dirname(mp), exist_ok=True)
+                    with open(mp, "w", encoding="utf-8") as mf:
+                        mf.write("{}")
+
+                # Verify cross-model lookup finds MiniMax-H3's FL2VA/text_encoder shards
+                shared_hit = ns["_find_existing_model_file"](
+                    "minimax_h3_image", "text_encoder/model-00001-of-00014.safetensors"
+                )
+                self.assertIsNotNone(shared_hit)
+                self.assertIn("MiniMax-H3/FL2VA/text_encoder", shared_hit)
+
+                out_dir = ns["prepare_minimax_h3_image_assembled_dir"](
+                    target_id="minimax_h3_image",
+                    repo_id="MiniMaxAI/MiniMax-H3-Image",
+                    link_weights=True,
+                )
+                self.assertEqual(out_dir, assembled_expected)
+                for fn, _ in ns["MINIMAX_H3_IMAGE_FILES"]:
+                    linked = os.path.join(out_dir, fn)
+                    self.assertTrue(os.path.islink(linked), f"Expected symlink for {fn}")
+                    self.assertTrue(os.path.exists(linked), f"Broken symlink for {fn}")
+
+    def test_inference_signature_and_oom_tiling_retry(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ns, FakeOOM = _load_minimax_h3_image_helpers(tmp)
+            calls = []
+
+            class _FakeImg:
+                def convert(self, mode):
+                    return f"RGB({mode})"
+
+            fake_vae = mock.MagicMock()
+
+            def _pipe_side_effect(**kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    raise FakeOOM("CUDA out of memory during 4K decode")
+                return ["FINAL_4K_PIL_IMAGE"]
+
+            fake_pipe = mock.MagicMock(side_effect=_pipe_side_effect)
+            fake_pipe.vae = fake_vae
+
+            res = ns["run_minimax_h3_image_inference"](
+                active_pipe=fake_pipe,
+                prompt="Put the cat from <Picture 1> onto <Picture 2>",
+                width=4096,
+                height=3072,
+                seed=12345,
+                ref_images=[_FakeImg(), _FakeImg()],
+            )
+            self.assertEqual(res, "FINAL_4K_PIL_IMAGE")
+            self.assertEqual(len(calls), 2)
+            fake_vae.enable_tiling.assert_called_once()
+            ns["_reclaim_transient_gpu_memory"].assert_called_once()
+
+            first_kw = calls[0]
+            self.assertEqual(first_kw["output"], "images")
+            self.assertEqual(first_kw["width"], 4096)
+            self.assertEqual(first_kw["height"], 3072)
+            self.assertEqual(first_kw["generator"].device, "cpu")
+            self.assertEqual(first_kw["generator"].seed, 12345)
+            self.assertEqual(len(first_kw["image"]), 2)
+            self.assertNotIn("num_inference_steps", first_kw)
+            self.assertNotIn("guidance_scale", first_kw)
+            self.assertNotIn("negative_prompt", first_kw)
+
+
 if __name__ == "__main__":
     unittest.main()

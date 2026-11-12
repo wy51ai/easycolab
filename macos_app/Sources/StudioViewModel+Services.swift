@@ -768,7 +768,11 @@ extension StudioViewModel {
     func loadPersistedCustomModels() {
         guard let data = UserDefaults.standard.data(forKey: customModelsDefaultsKey),
               let dtos = try? JSONDecoder().decode([CustomHFModelDTO].self, from: data) else { return }
-        customModels = dtos.map { OpenModelSpec.fromCustomDTO($0) }
+        let filtered = dtos.filter { $0.repo_id.lowercased() != "minimaxai/minimax-h3-image" }
+        customModels = filtered.map { OpenModelSpec.fromCustomDTO($0) }
+        if filtered.count != dtos.count {
+            savePersistedCustomModels()
+        }
     }
 
     func savePersistedCustomModels() {
@@ -797,12 +801,15 @@ extension StudioViewModel {
     }
 
     func mergeRemoteCustomModels(_ remoteDTOs: [CustomHFModelDTO]) {
+        let validRemote = remoteDTOs.filter { $0.repo_id.lowercased() != "minimaxai/minimax-h3-image" }
         var existingById: [String: OpenModelSpec] = [:]
-        for item in customModels { existingById[item.id] = item }
-        for dto in remoteDTOs {
+        for item in customModels where item.repoId.lowercased() != "minimaxai/minimax-h3-image" {
+            existingById[item.id] = item
+        }
+        for dto in validRemote {
             existingById[dto.id] = OpenModelSpec.fromCustomDTO(dto)
         }
-        let orderedIds = remoteDTOs.map { $0.id } + customModels.map { $0.id }.filter { id in !remoteDTOs.contains(where: { $0.id == id }) }
+        let orderedIds = validRemote.map { $0.id } + customModels.map { $0.id }.filter { id in !validRemote.contains(where: { $0.id == id }) }
         customModels = orderedIds.compactMap { existingById[$0] }
         savePersistedCustomModels()
     }
@@ -1171,6 +1178,25 @@ extension StudioViewModel {
         let customName = customDisplayNameInput.trimmingCharacters(in: .whitespacesAndNewlines)
         let modPref = customModalityInput
 
+        if repo.lowercased() == "minimaxai/minimax-h3-image" && inc.isEmpty,
+           let builtinSpec = OPEN_MODEL_CATALOG.first(where: { $0.id == "minimax_h3_image" }) {
+            customModels.removeAll { $0.repoId.lowercased() == "minimaxai/minimax-h3-image" }
+            savePersistedCustomModels()
+            switchSelectedModel(builtinSpec)
+            showAddCustomModelSheet = false
+            customRepoInput = ""
+            customIncludePatternInput = ""
+            customDisplayNameInput = ""
+            statusMessage = L(
+                "已切换至内置专属引擎「MiniMax-H3-Image (33B · 4K)」（支持 6 步原生 4K ModularPipeline 与编码器零拷贝共享）！",
+                "Switched to built-in dedicated engine 'MiniMax-H3-Image (33B · 4K)' (6-step native 4K ModularPipeline + shared encoder)!"
+            )
+            if autoDownload && isConnected {
+                await startRemoteDownloadWeights()
+            }
+            return
+        }
+
         let base = normalizedBaseURL
         if isConnected, !base.isEmpty, let url = URL(string: "\(base)/minimax_api/custom_model/register") {
             do {
@@ -1232,10 +1258,10 @@ extension StudioViewModel {
         let resolvedMod: String
         if modPref == "auto" {
             let lower = (repo + " " + inc).lowercased()
-            if lower.contains("video") || lower.contains("wan") || lower.contains("ltx") || lower.contains("minimax") || lower.contains("hunyuan") {
-                resolvedMod = "video_audio"
-            } else if lower.contains("flux") || lower.contains("image") || lower.contains("sdxl") || lower.contains("z-image") {
+            if lower.contains("flux") || lower.contains("image") || lower.contains("sdxl") || lower.contains("z-image") {
                 resolvedMod = "image"
+            } else if lower.contains("video") || lower.contains("wan") || lower.contains("ltx") || lower.contains("minimax") || lower.contains("hunyuan") {
+                resolvedMod = "video_audio"
             } else {
                 resolvedMod = "llm_vlm"
             }
