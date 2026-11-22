@@ -90,7 +90,8 @@ def _sync_macos_system_proxies_to_env():
 _sync_macos_system_proxies_to_env()
 os.environ.setdefault("COLAB_CLI_REQUEST_TIMEOUT", "75")
 
-from colab_cli.auth import PUBLIC_SCOPES, TOKEN_CONFIG_PATH, REMOTE_REDIRECT_URI
+from colab_cli import auth as _colab_auth
+from colab_cli.auth import PUBLIC_SCOPES, REMOTE_REDIRECT_URI
 from colab_cli.common import state
 from colab_cli.client import (
     Accelerator,
@@ -106,6 +107,77 @@ from colab_cli.state import SessionState
 from colab_cli.runtime import ColabRuntime
 from colab_cli.contents import ContentsClient
 
+# google-colab-cli >= 0.7.6 moved OAuth tokens to the OS keyring and renamed
+# TOKEN_CONFIG_PATH -> LEGACY_TOKEN_PATH. Support both keyring and legacy file storage.
+TOKEN_CONFIG_PATH = getattr(
+    _colab_auth,
+    "TOKEN_CONFIG_PATH",
+    getattr(_colab_auth, "LEGACY_TOKEN_PATH", os.path.expanduser("~/.config/colab-cli/token.json")),
+)
+_USE_KEYRING_AUTH = hasattr(_colab_auth, "_get_token_from_keyring") and hasattr(_colab_auth, "_save_token_to_keyring")
+
+
+def _ensure_colab_config_dir() -> None:
+    try:
+        cfg_dir = os.path.dirname(TOKEN_CONFIG_PATH) or os.path.expanduser("~/.config/colab-cli")
+        os.makedirs(cfg_dir, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _load_oauth_token_json() -> str:
+    if _USE_KEYRING_AUTH:
+        try:
+            tok = _colab_auth._get_token_from_keyring()
+            if tok:
+                return str(tok)
+        except Exception:
+            pass
+    if TOKEN_CONFIG_PATH and os.path.exists(TOKEN_CONFIG_PATH):
+        try:
+            with open(TOKEN_CONFIG_PATH, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            pass
+    return ""
+
+
+def _save_oauth_token_json(token_json: str) -> None:
+    saved_to_keyring = False
+    if _USE_KEYRING_AUTH:
+        try:
+            _colab_auth._save_token_to_keyring(token_json)
+            saved_to_keyring = True
+            if hasattr(_colab_auth, "_remove_legacy_token"):
+                _colab_auth._remove_legacy_token()
+        except Exception:
+            saved_to_keyring = False
+    if not saved_to_keyring:
+        _ensure_colab_config_dir()
+        with open(TOKEN_CONFIG_PATH, "w", encoding="utf-8") as f:
+            f.write(token_json)
+
+
+def _delete_oauth_token() -> None:
+    if _USE_KEYRING_AUTH:
+        try:
+            import keyring
+            svc = getattr(_colab_auth, "KEYRING_SERVICE_NAME", "google-colab-cli")
+            usr = getattr(_colab_auth, "KEYRING_USERNAME", "oauth_token")
+            runner = getattr(_colab_auth, "_run_with_timeout", None)
+            timeout_s = float(getattr(_colab_auth, "KEYRING_TIMEOUT_SECONDS", 30.0))
+            if callable(runner):
+                runner(keyring.delete_password, svc, usr, timeout=timeout_s)
+            else:
+                keyring.delete_password(svc, usr)
+        except Exception:
+            pass
+    if TOKEN_CONFIG_PATH and os.path.exists(TOKEN_CONFIG_PATH):
+        try:
+            os.remove(TOKEN_CONFIG_PATH)
+        except Exception:
+            pass
+
 
 def _load_client_config() -> dict:
     cfg_path = os.path.expanduser("~/.colab-cli-oauth-config.json")
@@ -117,16 +189,16 @@ def _load_client_config() -> dict:
 
 
 def _has_valid_token() -> bool:
-    if not os.path.exists(TOKEN_CONFIG_PATH):
+    raw_json = _load_oauth_token_json()
+    if not raw_json:
         return False
     try:
-        creds = Credentials.from_authorized_user_file(TOKEN_CONFIG_PATH, PUBLIC_SCOPES)
+        creds = Credentials.from_authorized_user_info(json.loads(raw_json), PUBLIC_SCOPES)
         if creds and creds.valid:
             return True
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            with open(TOKEN_CONFIG_PATH, "w", encoding="utf-8") as f:
-                f.write(creds.to_json())
+            _save_oauth_token_json(creds.to_json())
             return True
     except Exception:
         return False
@@ -139,6 +211,7 @@ ACCOUNT_PROFILE_CACHE_PATH = os.path.expanduser("~/.config/colab-cli/account_pro
 
 def _clear_local_session_store():
     """切换或退出 Google 账号时，清理本地缓存的旧账号 Colab 会话记录"""
+    _ensure_colab_config_dir()
     try:
         existing = state.store.list()
         if isinstance(existing, dict):
@@ -152,14 +225,14 @@ def _clear_local_session_store():
 
 def _get_account_email() -> str:
     """获取当前绑定 Google 账号邮箱（按 refresh_token 指纹本地缓存，避免重复请求）"""
-    if not os.path.exists(TOKEN_CONFIG_PATH):
+    raw_json = _load_oauth_token_json()
+    if not raw_json:
         return ""
     try:
-        creds = Credentials.from_authorized_user_file(TOKEN_CONFIG_PATH, PUBLIC_SCOPES)
+        creds = Credentials.from_authorized_user_info(json.loads(raw_json), PUBLIC_SCOPES)
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            with open(TOKEN_CONFIG_PATH, "w", encoding="utf-8") as f:
-                f.write(creds.to_json())
+            _save_oauth_token_json(creds.to_json())
         tok_fp = (creds.refresh_token or creds.token or "")[-20:]
         if tok_fp and os.path.exists(ACCOUNT_PROFILE_CACHE_PATH):
             try:
@@ -217,9 +290,7 @@ def cmd_auth_code(code: str):
                     os.remove(p)
                 except Exception:
                     pass
-        os.makedirs(os.path.dirname(TOKEN_CONFIG_PATH), exist_ok=True)
-        with open(TOKEN_CONFIG_PATH, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
+        _save_oauth_token_json(creds.to_json())
         return cmd_auth_status()
     except Exception as e:
         print(json.dumps({"ok": False, "logged_in": False, "error": str(e)}))
@@ -227,7 +298,8 @@ def cmd_auth_code(code: str):
 
 def cmd_auth_logout():
     _clear_local_session_store()
-    for p in (TOKEN_CONFIG_PATH, PKCE_VERIFIER_PATH, ACCOUNT_PROFILE_CACHE_PATH):
+    _delete_oauth_token()
+    for p in (PKCE_VERIFIER_PATH, ACCOUNT_PROFILE_CACHE_PATH):
         if os.path.exists(p):
             try:
                 os.remove(p)
@@ -244,6 +316,7 @@ def _quiet_colab_cli():
 
 
 def _safe_sync_sessions():
+    _ensure_colab_config_dir()
     for attempt in range(3):
         try:
             with _quiet_colab_cli():
@@ -306,7 +379,7 @@ def cmd_auth_status():
 ADC_PUBLIC_CLIENT_PREFIX = "764086051850-"
 
 
-def _build_rclone_drive_conf(token_path: str = TOKEN_CONFIG_PATH) -> str:
+def _build_rclone_drive_conf(token_path: str | None = None) -> str:
     """
     当用户配置了自有 Google Cloud OAuth Client（或显式携带 quota_project_id）时，
     生成云端 rclone Google Drive 备用配置。
@@ -314,21 +387,31 @@ def _build_rclone_drive_conf(token_path: str = TOKEN_CONFIG_PATH) -> str:
     drive.googleapis.com 会被 Google 直接返回 403 SERVICE_DISABLED，此时跳过 rclone 配置，
     生成的成片由客户端自动拉取保存至本地电脑。
     """
-    if not os.path.exists(token_path):
-        return ""
     try:
-        with open(token_path, "r", encoding="utf-8") as rf:
-            pre_raw = json.load(rf)
+        if token_path is not None:
+            if not os.path.exists(token_path):
+                return ""
+            with open(token_path, "r", encoding="utf-8") as rf:
+                raw_json = rf.read()
+        else:
+            raw_json = _load_oauth_token_json()
+        if not raw_json:
+            return ""
+        pre_raw = json.loads(raw_json)
         pre_cid = str(pre_raw.get("client_id") or "").strip()
         pre_qp = str(pre_raw.get("quota_project_id") or "").strip()
         if pre_cid.startswith(ADC_PUBLIC_CLIENT_PREFIX) and not pre_qp:
             return ""
 
-        creds = Credentials.from_authorized_user_file(token_path, PUBLIC_SCOPES)
+        creds = Credentials.from_authorized_user_info(pre_raw, PUBLIC_SCOPES)
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            with open(token_path, "w", encoding="utf-8") as f:
-                f.write(creds.to_json())
+            refreshed = creds.to_json()
+            if token_path is not None:
+                with open(token_path, "w", encoding="utf-8") as f:
+                    f.write(refreshed)
+            else:
+                _save_oauth_token_json(refreshed)
         raw = json.loads(creds.to_json())
         client_id = str(raw.get("client_id") or "").strip()
         quota_project = str(raw.get("quota_project_id") or "").strip()
@@ -1491,6 +1574,7 @@ def cmd_keepalive_daemon():
 
 
 def main(argv=None):
+    _ensure_colab_config_dir()
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
 

@@ -154,30 +154,61 @@ extension StudioViewModel {
         return trimmed
     }
 
-    func runBridgeCommand(_ args: [String], installIfMissing: Bool = false) async -> String {
+    private func runBridgeCommandDetailed(
+        _ args: [String],
+        installIfMissing: Bool = false
+    ) async -> (output: String, stderr: String, exitCode: Int32) {
         guard let pyBin = await ensureBridgePythonBin(installIfMissing: installIfMissing) else {
-            return ""
+            return ("", "", -1)
         }
         let script = self.bridgeScript
-        return await withCheckedContinuation { continuation in
+        let result: (output: String, stderr: String, exitCode: Int32) = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: pyBin)
                 proc.arguments = [script] + args
                 let outPipe = Pipe()
+                let errPipe = Pipe()
                 proc.standardOutput = outPipe
-                proc.standardError = FileHandle.nullDevice
+                proc.standardError = errPipe
                 do {
                     try proc.run()
-                    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    var outData = Data()
+                    var errData = Data()
+                    let group = DispatchGroup()
+                    group.enter()
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                        group.leave()
+                    }
+                    outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    group.wait()
                     proc.waitUntilExit()
-                    let out = String(data: data, encoding: .utf8) ?? ""
-                    continuation.resume(returning: Self.extractJSONPayload(from: out))
+                    let out = String(data: outData, encoding: .utf8) ?? ""
+                    let err = String(data: errData, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    continuation.resume(returning: (Self.extractJSONPayload(from: out), err, proc.terminationStatus))
                 } catch {
-                    continuation.resume(returning: "")
+                    continuation.resume(returning: ("", error.localizedDescription, -1))
                 }
             }
         }
+        if (result.exitCode != 0 || result.output.isEmpty) && !result.stderr.isEmpty {
+            let subcmd = args.first ?? "bridge"
+            let tailLines = result.stderr
+                .components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .suffix(6)
+            for line in tailLines {
+                liveConsoleLines.append("[colab_bridge \(subcmd)] \(line)")
+            }
+        }
+        return result
+    }
+
+    func runBridgeCommand(_ args: [String], installIfMissing: Bool = false) async -> String {
+        await runBridgeCommandDetailed(args, installIfMissing: installIfMissing).output
     }
 
     func refreshOfficialColabAccountUsage() async {
@@ -209,13 +240,26 @@ extension StudioViewModel {
     }
 
     func startGoogleOAuthLogin(switchingAccount: Bool = false) async {
-        let out = await runBridgeCommand(["auth_url"], installIfMissing: true)
+        let res = await runBridgeCommandDetailed(["auth_url"], installIfMissing: true)
+        let out = res.output
         guard let data = out.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let authURLStr = json["auth_url"] as? String,
               let url = URL(string: authURLStr) else {
             if !statusMessage.contains("初始化") && !statusMessage.contains("Initializ") && !statusMessage.contains("Python") {
-                statusMessage = L("获取 Google 授权链接失败", "Failed to obtain Google OAuth authorization URL")
+                let errSummary = res.stderr
+                    .components(separatedBy: .newlines)
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .last(where: { !$0.isEmpty }) ?? ""
+                if !errSummary.isEmpty {
+                    let clipped = errSummary.count > 140 ? String(errSummary.prefix(140)) + "…" : errSummary
+                    statusMessage = L(
+                        "获取 Google 授权链接失败: \(clipped)",
+                        "Failed to obtain Google OAuth authorization URL: \(clipped)"
+                    )
+                } else {
+                    statusMessage = L("获取 Google 授权链接失败", "Failed to obtain Google OAuth authorization URL")
+                }
             }
             return
         }
