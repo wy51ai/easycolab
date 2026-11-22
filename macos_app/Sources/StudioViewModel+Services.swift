@@ -64,10 +64,13 @@ extension StudioViewModel {
         }
         guard installIfMissing else { return nil }
 
-        guard let sysPy = LocalRuntimePaths.findSystemPython3() else {
+        let pyCandidates = await Task.detached(priority: .userInitiated) {
+            LocalRuntimePaths.findSystemPython3Candidates()
+        }.value
+        guard !pyCandidates.isEmpty else {
             statusMessage = L(
-                "未检测到 macOS Python 3 环境，请先安装 Xcode Command Line Tools (xcode-select --install)。",
-                "macOS Python 3 not found. Please install Xcode Command Line Tools (xcode-select --install)."
+                "未检测到 Python 3.12+ 环境（macOS 自带的 Python 3.9 不兼容 google-colab-cli），请先安装：brew install python@3.13",
+                "Python 3.12+ not found (macOS system Python 3.9 is incompatible with google-colab-cli). Install via: brew install python@3.13"
             )
             return nil
         }
@@ -86,43 +89,100 @@ extension StudioViewModel {
             "[Local Init] Installing google-colab-cli dependencies in ~/Library/Application Support/EasyColab/venv..."
         ))
 
-        let ok = await Task.detached(priority: .userInitiated) { () -> Bool in
-            let mkProc = Process()
-            mkProc.executableURL = URL(fileURLWithPath: sysPy)
-            mkProc.arguments = ["-m", "venv", venvDir.path]
-            mkProc.standardOutput = Pipe()
-            mkProc.standardError = Pipe()
-            do {
-                try mkProc.run()
-                mkProc.waitUntilExit()
-                guard mkProc.terminationStatus == 0 else { return false }
-            } catch {
-                return false
+        let (ok, errDetail) = await Task.detached(priority: .userInitiated) { () -> (Bool, String) in
+            let fm = FileManager.default
+            let backupDir = venvDir.deletingLastPathComponent()
+                .appendingPathComponent("venv.backup-\(UUID().uuidString)", isDirectory: true)
+            var backedUpExisting = false
+            if fm.fileExists(atPath: venvDir.path) {
+                do {
+                    try fm.moveItem(at: venvDir, to: backupDir)
+                    backedUpExisting = true
+                } catch {
+                    return (false, error.localizedDescription)
+                }
             }
 
-            let pipProc = Process()
-            pipProc.executableURL = URL(fileURLWithPath: venvPy)
-            if hasReqFile {
-                pipProc.arguments = ["-m", "pip", "install", "-q", "--upgrade", "pip", "-r", reqFile]
-            } else {
-                pipProc.arguments = [
-                    "-m", "pip", "install", "-q", "--upgrade", "pip",
-                    "google-colab-cli>=0.7.5",
-                    "google-auth>=2.28.0",
-                    "google-auth-oauthlib>=1.2.0",
-                    "requests>=2.31.0",
-                    "websocket-client>=1.7.0"
-                ]
+            var lastErr = ""
+            for sysPy in pyCandidates {
+                if fm.fileExists(atPath: venvDir.path) {
+                    try? fm.removeItem(at: venvDir)
+                }
+
+                let mkProc = Process()
+                mkProc.executableURL = URL(fileURLWithPath: sysPy)
+                mkProc.arguments = ["-m", "venv", venvDir.path]
+                mkProc.standardOutput = FileHandle.nullDevice
+                let mkErr = Pipe()
+                mkProc.standardError = mkErr
+                do {
+                    try mkProc.run()
+                    let errData = mkErr.fileHandleForReading.readDataToEndOfFile()
+                    mkProc.waitUntilExit()
+                    guard mkProc.terminationStatus == 0, fm.isExecutableFile(atPath: venvPy) else {
+                        lastErr = String(data: errData, encoding: .utf8)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        continue
+                    }
+                } catch {
+                    lastErr = error.localizedDescription
+                    continue
+                }
+
+                let pipProc = Process()
+                pipProc.executableURL = URL(fileURLWithPath: venvPy)
+                if hasReqFile {
+                    pipProc.arguments = ["-m", "pip", "install", "-q", "--upgrade", "pip", "-r", reqFile]
+                } else {
+                    pipProc.arguments = [
+                        "-m", "pip", "install", "-q", "--upgrade", "pip",
+                        "google-colab-cli>=0.7.5",
+                        "google-auth>=2.28.0",
+                        "google-auth-oauthlib>=1.2.0",
+                        "requests>=2.31.0",
+                        "websocket-client>=1.7.0"
+                    ]
+                }
+                pipProc.standardOutput = FileHandle.nullDevice
+                let pipErr = Pipe()
+                pipProc.standardError = pipErr
+                do {
+                    try pipProc.run()
+                    let errData = pipErr.fileHandleForReading.readDataToEndOfFile()
+                    pipProc.waitUntilExit()
+                    if pipProc.terminationStatus == 0 {
+                        if backedUpExisting {
+                            try? fm.removeItem(at: backupDir)
+                        }
+                        return (true, "")
+                    }
+                    lastErr = String(data: errData, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                } catch {
+                    lastErr = error.localizedDescription
+                }
             }
-            pipProc.standardOutput = Pipe()
-            pipProc.standardError = Pipe()
-            do {
-                try pipProc.run()
-                pipProc.waitUntilExit()
-                return pipProc.terminationStatus == 0
-            } catch {
-                return false
+
+            var restoreNotes: [String] = []
+            if fm.fileExists(atPath: venvDir.path) {
+                do {
+                    try fm.removeItem(at: venvDir)
+                } catch {
+                    restoreNotes.append("failed to clean partial venv: \(error.localizedDescription)")
+                }
             }
+            if backedUpExisting {
+                do {
+                    try fm.moveItem(at: backupDir, to: venvDir)
+                } catch {
+                    restoreNotes.append("failed to restore previous venv from \(backupDir.path): \(error.localizedDescription)")
+                }
+            }
+            if !restoreNotes.isEmpty {
+                let note = restoreNotes.joined(separator: "; ")
+                lastErr = lastErr.isEmpty ? note : "\(lastErr)\n\(note)"
+            }
+            return (false, lastErr)
         }.value
 
         if ok, FileManager.default.isExecutableFile(atPath: venvPy) {
@@ -133,6 +193,10 @@ extension StudioViewModel {
             ))
             return venvPy
         } else {
+            if !errDetail.isEmpty {
+                let tail = errDetail.components(separatedBy: .newlines).suffix(3).joined(separator: " | ")
+                liveConsoleLines.append("[本地初始化失败] \(tail)")
+            }
             statusMessage = L(
                 "自动安装本地连接依赖失败，请检查网络或执行 pip install -r requirements.txt。",
                 "Failed to install local bridge dependencies. Check your network or run pip install -r requirements.txt."

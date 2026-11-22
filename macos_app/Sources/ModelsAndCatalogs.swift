@@ -1187,15 +1187,170 @@ enum LocalRuntimePaths {
         return nil
     }
 
-    static func findSystemPython3() -> String? {
+    /// Minimum Python version required by `google-colab-cli>=0.7.5` (`Requires-Python: >=3.12`).
+    static let minimumBridgePythonVersion = (major: 3, minor: 12)
+
+    private static func parsePythonMinorVersion(_ name: String, prefix: String) -> Int? {
+        guard name.hasPrefix(prefix) else { return nil }
+        let suffix = name.dropFirst(prefix.count)
+        guard !suffix.isEmpty, suffix.allSatisfy(\.isNumber) else { return nil }
+        return Int(suffix)
+    }
+
+    private static func versionedBinaries(in dirPath: String, fm: FileManager) -> [String] {
+        guard let entries = try? fm.contentsOfDirectory(atPath: dirPath) else { return [] }
+        let versioned = entries
+            .compactMap { name -> (Int, String)? in
+                guard let minor = parsePythonMinorVersion(name, prefix: "python3.") else { return nil }
+                return (minor, "\(dirPath)/\(name)")
+            }
+            .sorted { $0.0 > $1.0 }
+            .map(\.1)
+        return versioned + ["\(dirPath)/python3"]
+    }
+
+    private static func versionedSubdirPythons(
+        in baseDir: String,
+        dirPrefix: String,
+        fm: FileManager
+    ) -> [String] {
+        guard let entries = try? fm.contentsOfDirectory(atPath: baseDir) else { return [] }
+        let sorted = entries
+            .filter { $0.hasPrefix(dirPrefix) }
+            .sorted { $0.localizedStandardCompare($1) == .orderedDescending }
+        return sorted.map { "\(baseDir)/\($0)/bin/python3" }
+    }
+
+    static func pythonVersion(at executablePath: String, timeoutSeconds: TimeInterval = 3.0) -> (major: Int, minor: Int)? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executablePath)
+        proc.arguments = ["-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"]
+        let outPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = FileHandle.nullDevice
+
+        let exitSem = DispatchSemaphore(value: 0)
+        proc.terminationHandler = { _ in exitSem.signal() }
+        guard (try? proc.run()) != nil else { return nil }
+
+        let readGroup = DispatchGroup()
+        let dataLock = NSLock()
+        var captured = Data()
+        readGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let chunk = outPipe.fileHandleForReading.readDataToEndOfFile()
+            dataLock.lock()
+            captured = chunk
+            dataLock.unlock()
+            readGroup.leave()
+        }
+
+        if exitSem.wait(timeout: .now() + timeoutSeconds) == .timedOut {
+            proc.terminate()
+            _ = exitSem.wait(timeout: .now() + 0.5)
+            try? outPipe.fileHandleForReading.close()
+            return nil
+        }
+        guard readGroup.wait(timeout: .now() + 1.0) == .success else {
+            try? outPipe.fileHandleForReading.close()
+            return nil
+        }
+
+        dataLock.lock()
+        let data = captured
+        dataLock.unlock()
+
+        guard proc.terminationStatus == 0,
+              let text = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return nil
+        }
+        let parts = text.split(separator: ".")
+        guard parts.count >= 2,
+              let major = Int(parts[0]),
+              let minor = Int(parts[1]) else {
+            return nil
+        }
+        return (major, minor)
+    }
+
+    private static func homebrewOptPythons(in optDir: String, fm: FileManager) -> [String] {
+        guard let entries = try? fm.contentsOfDirectory(atPath: optDir) else { return [] }
+        let versioned = entries
+            .compactMap { name -> (Int, String)? in
+                guard let minor = parsePythonMinorVersion(name, prefix: "python@3.") else { return nil }
+                return (minor, "\(optDir)/\(name)")
+            }
+            .sorted { $0.0 > $1.0 }
+            .flatMap { ["\($0.1)/libexec/bin/python3", "\($0.1)/bin/python3.\($0.0)"] }
+        return versioned
+    }
+
+    static func findSystemPython3Candidates(
+        minMajor: Int = minimumBridgePythonVersion.major,
+        minMinor: Int = minimumBridgePythonVersion.minor
+    ) -> [String] {
         let fm = FileManager.default
-        let candidates = [
-            "/opt/homebrew/bin/python3",
-            "/usr/local/bin/python3",
-            "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
-            "/usr/bin/python3"
-        ]
-        return candidates.first { fm.isExecutableFile(atPath: $0) }
+        let home = NSHomeDirectory()
+        var candidates: [String] = []
+
+        // 1. Homebrew (Apple Silicon & Intel), including versioned & unlinked formulae like python@3.13
+        candidates.append(contentsOf: versionedBinaries(in: "/opt/homebrew/bin", fm: fm))
+        candidates.append(contentsOf: homebrewOptPythons(in: "/opt/homebrew/opt", fm: fm))
+        candidates.append(contentsOf: versionedBinaries(in: "/usr/local/bin", fm: fm))
+        candidates.append(contentsOf: homebrewOptPythons(in: "/usr/local/opt", fm: fm))
+
+        // 2. Official python.org Framework builds
+        candidates.append(contentsOf: versionedSubdirPythons(
+            in: "/Library/Frameworks/Python.framework/Versions",
+            dirPrefix: "3.",
+            fm: fm
+        ))
+        candidates.append("/Library/Frameworks/Python.framework/Versions/Current/bin/python3")
+
+        // 3. Common user-managed Python installations (uv, pyenv, mise, MacPorts)
+        candidates.append(contentsOf: versionedSubdirPythons(
+            in: "\(home)/.local/share/uv/python",
+            dirPrefix: "cpython-3.",
+            fm: fm
+        ))
+        candidates.append(contentsOf: versionedSubdirPythons(
+            in: "\(home)/.pyenv/versions",
+            dirPrefix: "3.",
+            fm: fm
+        ))
+        candidates.append(contentsOf: versionedSubdirPythons(
+            in: "\(home)/.local/share/mise/installs/python",
+            dirPrefix: "3.",
+            fm: fm
+        ))
+        candidates.append(contentsOf: versionedBinaries(in: "/opt/local/bin", fm: fm))
+
+        // 4. PATH entries and /usr/bin/python3 as final fallback
+        if let pathEnv = ProcessInfo.processInfo.environment["PATH"] {
+            for dir in pathEnv.split(separator: ":").map(String.init) where !dir.isEmpty {
+                candidates.append(contentsOf: versionedBinaries(in: dir, fm: fm))
+            }
+        }
+        candidates.append("/usr/bin/python3")
+
+        var seen = Set<String>()
+        var matched: [String] = []
+        for path in candidates {
+            guard seen.insert(path).inserted, fm.isExecutableFile(atPath: path) else { continue }
+            guard let ver = pythonVersion(at: path) else { continue }
+            if ver.major > minMajor || (ver.major == minMajor && ver.minor >= minMinor) {
+                matched.append(path)
+            }
+        }
+        return matched
+    }
+
+    static func findSystemPython3(
+        minMajor: Int = minimumBridgePythonVersion.major,
+        minMinor: Int = minimumBridgePythonVersion.minor
+    ) -> String? {
+        findSystemPython3Candidates(minMajor: minMajor, minMinor: minMinor).first
     }
 }
 
